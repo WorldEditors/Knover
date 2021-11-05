@@ -70,4 +70,4 @@ def add_cmdline_args(parser):
 
 
 import knover.models.unified_transformer
-import knover.models.plastic_rnn
+import knover.models.recursive
