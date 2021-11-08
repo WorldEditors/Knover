@@ -11,11 +11,12 @@ fi
 
 export FLAGS_sync_nccl_allreduce=1
 export FLAGS_fuse_parameter_memory_size=64
+ROOTPATH=$(readlink -f "$(dirname "$0")/../../")
 
 mkdir -p ${save_path}
 
 python \
-    ./knover/scripts/train.py \
+    $ROOTPATH/knover/scripts/train.py \
     --model ${model:-"Plato"} \
     --task ${task:-"DialogGeneration"} \
     --vocab_path ${vocab_path} \
