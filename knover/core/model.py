@@ -69,6 +69,8 @@ class Model(nn.Layer, metaclass=ModelMeta):
         # training related
         group.add_argument("--use_amp", type=str2bool, default=False,
                            help="Whether to use automatic mixed precision(AMP) training")
+        group.add_argument("--amp_loss_scaling", type=float, default=32768.,
+                           help="The initial loss scaling of AMP.")
 
         return group
 
@@ -78,9 +80,6 @@ class Model(nn.Layer, metaclass=ModelMeta):
         self._build_model(args)
 
         self.place = place
-
-        # distributed settings
-        self.use_amp = args.use_amp
 
         # optimizer related
         self.lr_scheduler = self._get_lr_scheduler(args)
@@ -215,17 +214,29 @@ class Model(nn.Layer, metaclass=ModelMeta):
         Args:
             metrics: A dict mapping metric names to corresponding metrics, which must include loss.
         """
-        metrics["loss"].backward()
         if isinstance(self.lr_scheduler, paddle.optimizer.lr.LRScheduler):
             self.lr_scheduler.step()
         metrics["scheduled_lr"] = self.optimizer.get_lr()
-        self.optimizer.step()
+
+        # backward
+        loss = metrics["loss"]
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # optimize
+        if self.use_amp:
+            self.scaler.minimize(self.optimizer, loss)
+            metrics["loss_scaling"] = self.scaler._scale
+        else:
+            self.optimizer.step()
         self.optimizer.clear_grad()
         return
 
     def _get_lr_scheduler(self, args):
         if args.lr_scheduler == "noam" and args.warmup_steps <= 0:
-            print("[WARNING] Using constant learning rate because of `warmup_steps` is not positive while using NoamScheduler.")
+            print("[WARN] Using constant learning rate because of `warmup_steps` is not positive while using NoamScheduler.")
         if args.lr_scheduler == "noam" and args.warmup_steps > 0:
             scheduler = NoamDecay(
                 1 / (args.warmup_steps * (args.learning_rate ** 2)),
@@ -265,6 +276,9 @@ class Model(nn.Layer, metaclass=ModelMeta):
         Returns:
             optimizer: the optimizer used in model training.
         """
+        # amp settings
+        self.use_amp = args.use_amp
+
         # optimizer
         if not hasattr(knover.optim, args.optimizer):
             raise ValueError(f"Unspported optimizer class: {args.optimizer}.")
@@ -274,6 +288,10 @@ class Model(nn.Layer, metaclass=ModelMeta):
             parameters=self.parameters(),
             weight_decay=args.weight_decay,
             grad_clip=nn.ClipGradByGlobalNorm(args.max_grad_norm))
+
+        if self.use_amp:
+            self.scaler = paddle.amp.GradScaler(init_loss_scaling=args.amp_loss_scaling)
+            paddle.amp.decorate(self, optimizer, level="O1")
         return optimizer
 
     def _get_inputs(self, inputs, is_infer=False):
@@ -309,7 +327,10 @@ class Model(nn.Layer, metaclass=ModelMeta):
             metrics: A dict mapping keys to corresponding metrics.
         """
         self.train()
-        with paddle.amp.auto_cast(self.use_amp):
+        with paddle.amp.auto_cast(
+                self.use_amp,
+                custom_white_list=["layer_norm", "softmax", "gelu"],
+                level="O1"):
             inputs = self._get_inputs(inputs)
             outputs = self.forward(inputs)
             metrics = self.get_metrics(inputs, outputs)
@@ -380,8 +401,10 @@ class ModelInterface(object):
         if args.is_distributed:
             # distributed settings for dygraph.
             # now only support data parallel for dygraph.
-            self.model.optimizer = fleet.distributed_optimizer(self.model.optimizer)
             self.dp_model = fleet.distributed_model(self.model)
+            self.model.optimizer = fleet.distributed_optimizer(self.model.optimizer)
+            if self.model.use_amp:
+                self.model.scaler = fleet.distributed_scaler(self.model.scaler)
 
     def _get_outputs(self, outputs):
         """Convert Tensors into numpy arrays.
