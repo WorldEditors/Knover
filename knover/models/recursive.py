@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unified PlasticRNN model."""
+"""Recursive Model."""
 
 import numpy as np
 import paddle
@@ -21,13 +21,13 @@ import paddle.nn.functional as F
 from knover.models import register_model
 from knover.core.model import Model
 from knover.modules.generator import Generator
-from knover.modules.prnn_cell import PlasticRNNCell
+from knover.modules.prnn_cell import PlasticRNNCell, PlasticLSTMCell, ModulateRNNCell
 from knover.utils import gather, str2bool
 
 
-@register_model("PlasticRNN")
-class PlasticRNN(Model):
-    """Plastic RNN"""
+@register_model("RecursiveModels")
+class RecursiveModels(Model):
+    """Recursive Models"""
 
     @classmethod
     def add_cmdline_args(cls, parser):
@@ -63,6 +63,7 @@ class PlasticRNN(Model):
         if self.use_role:
             self.role_embedding = nn.Embedding(args.role_type_size, self.emb_size, weight_attr=param_attr)
 
+        print("hidden_size:", self.hidden_size, "emb_size:", self.emb_size)
         # embeding mapping
         if self.hidden_size != self.emb_size:
             self.emb_mapping_in = True
@@ -79,7 +80,9 @@ class PlasticRNN(Model):
         elif(args.encoder_type == "LSTM"):
             self._rnn_cell = nn.LSTMCell(self.hidden_size, self.hidden_size)
         elif(args.encoder_type == "PlasticLSTM"):
-            self._rnn_cell = nn.PlasticLSTMCell(self.hidden_size, self.hidden_size)
+            self._rnn_cell = PlasticLSTMCell(self.hidden_size, self.hidden_size)
+        elif(args.encoder_type == "ModulateRNN"):
+            self._rnn_cell = ModulateRNNCell(self.hidden_size, self.hidden_size, self.hidden_size)
         else:
             raise Exception("No such encoder type or encoder type not defined: %s" % args.encoder_type)
         self.encoder = nn.RNN(self._rnn_cell)
@@ -126,6 +129,7 @@ class PlasticRNN(Model):
 
         # concat auxiliary memory embeddings
         if aux_emb is not None:
+            print(aux_emb.shape, emb_out.shape)
             emb_out = paddle.concat([aux_emb, emb_out], axis=1)
 
         if self.emb_mapping_in:
@@ -160,7 +164,6 @@ class PlasticRNN(Model):
             state["token_ids"],
             state["type_ids"],
             state.get("role_ids", None),
-            state["tgt_generation_mask"],
         )
         logits = self._calc_logits(enc_out)
         return logits
@@ -174,7 +177,8 @@ class PlasticRNN(Model):
         Returns:
             The output embeddings of PlasticRNN.
         """
-        return self.encoder(emb_input)
+        ret = self.encoder(emb_input)
+        return ret
 
     def _calc_logits(self, enc_out, tgt_idx=None):
         """Get the logits of generation task.
