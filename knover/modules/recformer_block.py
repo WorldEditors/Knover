@@ -28,7 +28,7 @@ from paddle.nn import Layer, LayerList
 from paddle.framework import ParamAttr
 from paddle.fluid.data_feeder import convert_dtype
 from paddle.nn import TransformerDecoderLayer, MultiHeadAttention
-from paddle.nn.layer.transformer import _convert_attention_mask
+from paddle.nn.layer.transformer import _convert_attention_mask, _convert_param_attr_to_list
 
 __all__ = []
 
@@ -86,15 +86,12 @@ class RecFormerEncoderLayer(Layer):
         self.activation = getattr(F, activation)
 
     def forward(self, src, memory):
-        src_mask = _convert_attention_mask(src_mask, src.dtype)
-        memory_mask = _convert_attention_mask(memory_mask, memory.dtype)
-
-        residual = src
         l_m = memory.shape[1]
         l_s = src.shape[1]
         concat_src = paddle.concat(x=[memory, src], axis=1)
         if self.normalize_before:
             concat_src = self.norm1(concat_src)
+        residual = concat_src
 
         # Add cache for encoder for the usage like UniLM
         concat_src = self.self_attn(concat_src, concat_src, concat_src, None)
@@ -110,7 +107,7 @@ class RecFormerEncoderLayer(Layer):
         concat_src = residual + self.dropout2(concat_src)
         if not self.normalize_before:
             concat_src = self.norm2(concat_src)
-        return paddle.split(concat_src, [l_m, l_s])
+        return paddle.split(concat_src, [l_m, l_s], axis=1)
 
 class RecFormerEncoder(Layer):
     """
@@ -127,16 +124,17 @@ class RecFormerEncoder(Layer):
     def forward(self, src, memories):
         """
         src:  A tensor of shape [Batch, Sequence, Hidden]
-        memories:  A tensor of shape [Batch, NumLayers, Sequence, Hidden]
+        memories:  A NumLayers list of tensor of shape [Batch, Sequence, Hidden]
         """
-        assert(memories.shape[1] == self.num_layers), "The memories have different layers"
+        assert(len(memories) == self.num_layers), "The memories have different layers"
 
         new_memories = []
-        new_memories.append(src)
+        output = src
         for i, mod in enumerate(self.layers):
-            new_memories.append(mod(new_memories[-1], memories[i]))
+            out_memory, output = mod(output, memories[i])
+            new_memories.append(out_memory)
 
-        return new_memories[:, 1:, :, :]
+        return new_memories
 
 class RecFormerDecoder(Layer):
 
@@ -151,38 +149,35 @@ class RecFormerDecoder(Layer):
     def forward(self, tgt, memories, tgt_mask=None, caches=None):
         """
         tgt:  A tensor of shape [Batch, Sequence, Hidden]
-        memories:  A tensor of shape [Batch, NumLayers, Sequence, Hidden]
+        memories:  A NumLayers list of tensor of shape [Batch, Sequence, Hidden]
         """
         tgt_mask = _convert_attention_mask(tgt_mask, tgt.dtype)
-        memory_mask = _convert_attention_mask(memory_mask, memory.dtype)
 
         output = tgt
         new_caches = []
         for i, mod in enumerate(self.layers):
-            if cache is None:
+            if caches is None:
                 output = mod(output,
-                             memories[i],
-                             tgt_mask=tgt_mask,
-                             memory_mask=memory_mask,
-                             cache=None)
+                        memories[i],
+                        tgt_mask=tgt_mask,
+                        cache=None)
             else:
                 output, new_cache = mod(output,
-                            memories[i],
-                            tgt_mask=tgt_mask,
-                            memory_mask=memory_mask,
-                            cache=cache["cache"][i])
+                        memories[i],
+                        tgt_mask=tgt_mask,
+                        cache=caches["cache"][i])
                 new_caches.append(new_cache)
         if self.norm is not None:
             output = self.norm(output)
 
-        return output if cache is None else (output, new_caches)
+        return output if caches is None else (output, new_caches)
 
     def gen_cache(self, memory, do_zip=False):
         """
         Memory, tensor of [Batch, NumLayer, Sequence, Hidden]
         seg_idx, [0, seg_idx) represents the range of the memory
         """
-        cache = [layer.gen_cache(memory[:,i,:,:]) for (layer, i) in enumerate(self.layers)]
+        cache = [layer.gen_cache(memory[i]) for (i, layer) in enumerate(self.layers)]
         if do_zip:
             cache = list(zip(*cache))
         return cache

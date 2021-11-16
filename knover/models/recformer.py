@@ -18,6 +18,7 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 
+from paddle.nn import TransformerDecoderLayer
 from knover.models import register_model
 from knover.core.model import Model
 from knover.modules.generator import Generator
@@ -86,21 +87,19 @@ class RecFormer(Model):
         self.encoder_layer = RecFormerEncoderLayer(
             self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before,
-            encoder_weight_attr=param_attr)
+            weight_attr=param_attr)
         self.encoder = RecFormerEncoder(self.encoder_layer, self.n_layer)
 
         self.decoder_layer = TransformerDecoderLayer(
             self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before,
-            encoder_weight_attr=param_attr)
+            weight_attr=param_attr)
 
         if self.normalize_before:
             output_norm = nn.LayerNorm(self.hidden_size)
         else:
             output_norm = None
-
-        self.decoder = RecFormerDecoder(decoder_layer, num_layers,
-            output_norm)
+        self.decoder = RecFormerDecoder(self.decoder_layer, self.n_layer, output_norm)
 
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
@@ -210,10 +209,10 @@ class RecFormer(Model):
 
         caches = dict()
         caches["seg_id"] = 0
-        caches["memories"] = paddle.full(
-                shape=[batch_size, self.num_layers, self.segment_len, self.d_model], 
-                fill_value=0, dtype=emb_input.dtype)
-        caches["kv"] = self.decoder.gen_cache(l_memory)
+        caches["memories"] = [paddle.full(
+                shape=[batch_size, self.segment_len, self.hidden_size], 
+                fill_value=0, dtype=emb_input.dtype)] * self.n_layer
+        caches["kv"] = self.decoder.gen_cache(caches["memories"])
         return caches
 
     def _encode(self, emb_input, n_head_self_attn_mask, caches=None):
@@ -237,8 +236,8 @@ class RecFormer(Model):
         if(caches is not None):
             l_memories = caches["memories"]
         else:
-            l_memories = paddle.full(shape=[batch_size, self.num_layers, self.segment_len, self.d_model], 
-                    fill_value=0, dtype=emb_input.dtype)
+            l_memories = [paddle.full(shape=[batch_size, self.segment_len, self.hidden_size], 
+                    fill_value=0, dtype=emb_input.dtype)] * self.n_layer
         seg_num = (seq_len - 1) // self.segment_len + 1
         seg_len_list = [self.segment_len] * seg_num
         seg_len_list[-1] -= self.segment_len * seg_num - seq_len
@@ -249,30 +248,36 @@ class RecFormer(Model):
             seg_start = 0
         
         outputs = []
-        for seg_emb_input, idx in enumerate(seg_emb_inputs[seg_start:]):
+        for idx, seg_emb_input in enumerate(seg_emb_inputs[seg_start:]):
             seg_len = seg_emb_input.shape[1]
             mask = paddle.tensor.triu((paddle.ones(
                 (seg_len, seg_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
 
             # Output size [Batch, SegLen, HiddenDim]
-            output_seg, new_caches = self.decoder(seg_emb_inputs, l_memory, 
-                    tgt_mask=self.generate_sequare_subsequent_mask(tgt_inputs.shape[1]), 
-                    cache=caches["kv"])
-            caches["kv"] = new_caches
+            if(caches is not None):
+                output_seg, new_caches = self.decoder(seg_emb_input, l_memories, 
+                        tgt_mask=mask,cache=caches["kv"])
+                # Update Caches
+                caches["kv"] = new_caches
+            else:
+                output_seg = self.decoder(seg_emb_input, l_memories, 
+                        tgt_mask=mask)
+
             outputs.append(output_seg)
 
-            if(seg_emb_inputs.shape[1] >= self.segment_len):
-                # In case a seg is finished, update the cache
+            if(seg_emb_input.shape[1] >= self.segment_len):
+                # In case a seg is finished, re-initialize the cache all over again
                 # Incremental cache needs to be refreshed
                 # Static cache needs to be recaclulated from long_term_memory
-                l_memory, _ = self.encoder(src_seg, l_memory)
-                caches["seg_id"] += 1
-                caches["memories"] = l_memory
-                caches["kv"] = self.decoder.gen_cache(l_memory)
+                l_memories = self.encoder(seg_emb_input, l_memories)
+                if(caches is not None):
+                    caches["seg_id"] += 1
+                    caches["memories"] = l_memories
+                    caches["kv"] = self.decoder.gen_cache(l_memories)
 
         outputs = paddle.concat(x=outputs,axis=1)
 
-        return output if cache is None else (output, new_caches)
+        return outputs if caches is None else (output, new_caches)
 
     def _calc_logits(self, enc_out, tgt_idx=None):
         """Get the logits of generation task.
