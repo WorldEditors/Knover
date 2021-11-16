@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Recursive Model."""
+"""Unified Transformer model."""
 
 import numpy as np
 import paddle
@@ -21,13 +21,13 @@ import paddle.nn.functional as F
 from knover.models import register_model
 from knover.core.model import Model
 from knover.modules.generator import Generator
-from knover.modules.recursive_cells import PlasticRNNCell, PlasticLSTMCell, ModulateRNNCell
+from knover.modules.recformer_block import RecFormerEncoder, RecFormerDecoder, RecFormerEncoderLayer
 from knover.utils import gather, str2bool
 
 
-@register_model("RecursiveModels")
-class RecursiveModels(Model):
-    """Recursive Models"""
+@register_model("RecFormer")
+class RecFormer(Model):
+    """RecFormer"""
 
     @classmethod
     def add_cmdline_args(cls, parser):
@@ -50,20 +50,28 @@ class RecursiveModels(Model):
 
         self.emb_size = args.get("emb_size", args.hidden_size)
         self.hidden_size = args.hidden_size
-        self.hidden_act = args.hidden_act
+        self.dropout = args.hidden_dropout_prob
+
+        self.n_layer = args.num_hidden_layers
+        self.n_head = args.num_attention_heads
+        self.d_key = args.get("key_size", self.hidden_size // self.n_head)
+        self.d_value = args.get("value_size", self.hidden_size // self.n_head)
+        self.inner_hidden_size = args.get("inner_hidden_size", self.hidden_size * 4)
+        self.segment_len = args.get("segment_length", 128)
 
         # embeddings
         self.vocab_size = args.vocab_size
         self.type_size = args.type_vocab_size
+        self.pos_size = args.max_position_embeddings
         self.token_embedding = nn.Embedding(self.vocab_size, self.emb_size, weight_attr=param_attr)
         self.type_embedding = nn.Embedding(self.type_size, self.emb_size, weight_attr=param_attr)
+        self.pos_embedding = nn.Embedding(self.pos_size, self.emb_size, weight_attr=param_attr)
 
         # role embeddings
         self.use_role = args.use_role
         if self.use_role:
             self.role_embedding = nn.Embedding(args.role_type_size, self.emb_size, weight_attr=param_attr)
 
-        print("hidden_size:", self.hidden_size, "emb_size:", self.emb_size)
         # embeding mapping
         if self.hidden_size != self.emb_size:
             self.emb_mapping_in = True
@@ -72,20 +80,27 @@ class RecursiveModels(Model):
         if self.emb_mapping_in:
             self.emb_mapping_fc = nn.Linear(self.emb_size, self.hidden_size, weight_attr=param_attr)
 
-        # encoder
-        if(args.encoder_type == "PlasticRNN"):
-            self._rnn_cell = PlasticRNNCell(self.hidden_size, self.hidden_size)
-        elif(args.encoder_type == "NaiveRNN"):
-            self._rnn_cell = nn.SimpleRNNCell(self.hidden_size, self.hidden_size)
-        elif(args.encoder_type == "LSTM"):
-            self._rnn_cell = nn.LSTMCell(self.hidden_size, self.hidden_size)
-        elif(args.encoder_type == "PlasticLSTM"):
-            self._rnn_cell = PlasticLSTMCell(self.hidden_size, self.hidden_size)
-        elif(args.encoder_type == "ModulateRNN"):
-            self._rnn_cell = ModulateRNNCell(self.hidden_size, self.hidden_size)
+        # transformer encoder
+        self.normalize_before = args.get("normalize_before", True)
+        self.hidden_act = args.hidden_act
+        self.encoder_layer = RecFormerEncoderLayer(
+            self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
+            act_dropout=0, normalize_before=self.normalize_before,
+            encoder_weight_attr=param_attr)
+        self.encoder = RecFormerEncoder(self.encoder_layer, self.n_layer)
+
+        self.decoder_layer = TransformerDecoderLayer(
+            self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
+            act_dropout=0, normalize_before=self.normalize_before,
+            encoder_weight_attr=param_attr)
+
+        if self.normalize_before:
+            output_norm = nn.LayerNorm(self.hidden_size)
         else:
-            raise Exception("No such encoder type or encoder type not defined: %s" % args.encoder_type)
-        self.encoder = nn.RNN(self._rnn_cell)
+            output_norm = None
+
+        self.decoder = RecFormerDecoder(decoder_layer, num_layers,
+            output_norm)
 
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
@@ -107,21 +122,27 @@ class RecursiveModels(Model):
     def _gen_input(self,
                    token_ids,
                    type_ids,
+                   pos_ids,
                    role_ids,
+                   input_mask,
                    aux_emb=None):
-        """Generate input embeddings of PlasticRNN
+        """Generate input embeddings of Transformer
 
         Args:
             tokens_ids: represents the token id of each token, shape is [batch_size, max_seq_len, 1]
             type_ids: represents the type of each token, shape is [batch_size, max_seq_len, 1]
-            aux_emb: represents the auxiliary input embeddings of PlasticRNN.
+            pos_ids: represents the position of each token, shape is [batch_size, max_seq_len, 1]
+            input_mask: represents the attention masking mastrix in each Transformer blocks,
+                shape is [batch_size, max_seq_len, max_seq_len]
+            aux_emb: represents the auxiliary input embeddings of Transformer.
 
         Returns:
-            A Tuple contains the input embeddings and the attention masking matrix of PlasticRNN.
+            A Tuple contains the input embeddings and the attention masking matrix of Transformer.
         """
         token_emb_out = self.token_embedding(token_ids)
         type_emb_out = self.type_embedding(type_ids)
-        emb_out = token_emb_out + type_emb_out
+        pos_emb_out = self.pos_embedding(pos_ids)
+        emb_out = token_emb_out + type_emb_out + pos_emb_out
 
         if self.use_role:
             role_emb_out = self.role_embedding(role_ids)
@@ -129,56 +150,129 @@ class RecursiveModels(Model):
 
         # concat auxiliary memory embeddings
         if aux_emb is not None:
-            print(aux_emb.shape, emb_out.shape)
             emb_out = paddle.concat([aux_emb, emb_out], axis=1)
 
         if self.emb_mapping_in:
             emb_out = self.emb_mapping_fc(emb_out)
 
-        return emb_out
+        # generate n-head self-attention mask
+        self_attn_mask = paddle.scale(x=input_mask, scale=1e4, bias=-1.0, bias_after_scale=False)
+        n_head_self_attn_mask = paddle.unsqueeze(self_attn_mask, [1])
+
+        return emb_out, n_head_self_attn_mask
 
     def _generation_network(self,
                             token_ids,
                             type_ids,
+                            pos_ids,
                             role_ids,
+                            generation_mask,
                             aux_emb=None):
-        """Run PlasticRNN generation network.
+        """Run Transformer generation network.
 
         Args:
             tokens_ids: represents the token id of each token, shape is [batch_size, max_seq_len, 1]
             type_ids: represents the type of each token, shape is [batch_size, max_seq_len, 1]
-            aux_emb: represents the auxiliary input embeddings of PlasticRNN.
+            pos_ids: represents the position of each token, shape is [batch_size, max_seq_len, 1]
+            input_mask: represents the attention masking mastrix in each Transformer blocks,
+                shape is [batch_size, max_seq_len, max_seq_len]
+            aux_emb: represents the auxiliary input embeddings of Transformer.
 
         Returns:
-            The output embeddings of PlasticRNN.
+            The output embeddings of Transformer.
         """
-        emb_input = self._gen_input(
-            token_ids, type_ids, role_ids, aux_emb=aux_emb)
-        enc_out, final_states = self._encode(emb_input)
-
+        emb_input, n_head_self_attn_mask = self._gen_input(
+            token_ids, type_ids, pos_ids, role_ids, generation_mask, aux_emb=aux_emb)
+        if self._generation_caches is None:
+            enc_out =  self._encode(emb_input, n_head_self_attn_mask)
+        else:
+            enc_out, self._generation_caches = self._encode(
+                emb_input, n_head_self_attn_mask, self._generation_caches)
         return enc_out
 
     def _generation_step(self, state):
         # gather caches
+        if "parent_idx" in state:
+            raise Exception("RecFormer (Transformer-XL) can not support beam search currently")
         enc_out = self._generation_network(
             state["token_ids"],
             state["type_ids"],
+            state["pos_ids"],
             state.get("role_ids", None),
+            state["tgt_generation_mask"],
         )
         logits = self._calc_logits(enc_out)
         return logits
 
-    def _encode(self, emb_input):
-        """Run PlasticRNN encode pass.
+    def gen_cache(self, inputs):
+        batch_size = emb_input.shape[0]
+        seq_len = emb_input.shape[1]
+
+        caches = dict()
+        caches["seg_id"] = 0
+        caches["memories"] = paddle.full(
+                shape=[batch_size, self.num_layers, self.segment_len, self.d_model], 
+                fill_value=0, dtype=emb_input.dtype)
+        caches["kv"] = self.decoder.gen_cache(l_memory)
+        return caches
+
+    def _encode(self, emb_input, n_head_self_attn_mask, caches=None):
+        """Run Transformer encode pass.
 
         Args:
-            emb_input: represents the input embeddings fo PlasticRNN, shape is [batch_size, max_seq_len, hidden_dim]
+            emb_input: represents the input embeddings fo Transformer, shape is [batch_size, max_seq_len, hidden_dim]
+            n_head_self_attn_mask: represents the attention masking matrix,
+                shape is [batch_size, num_heads, max_seq_len, max_seq_len]
+            caches: Dict of {"seg_id": n_seg_id,
+                "memories": long_term_memories,
+                "kv": key_value_cache_for_decoder
+            }
 
         Returns:
-            The output embeddings of PlasticRNN.
+            The output embeddings of Transformer.
         """
-        ret = self.encoder(emb_input)
-        return ret
+        batch_size = emb_input.shape[0]
+        seq_len = emb_input.shape[1]
+
+        if(caches is not None):
+            l_memories = caches["memories"]
+        else:
+            l_memories = paddle.full(shape=[batch_size, self.num_layers, self.segment_len, self.d_model], 
+                    fill_value=0, dtype=emb_input.dtype)
+        seg_num = (seq_len - 1) // self.segment_len + 1
+        seg_len_list = [self.segment_len] * seg_num
+        seg_len_list[-1] -= self.segment_len * seg_num - seq_len
+        seg_emb_inputs = paddle.split(emb_input, seg_len_list, axis=1)
+        if(caches is not None):
+            seg_start = caches["seg_id"]
+        else:
+            seg_start = 0
+        
+        outputs = []
+        for seg_emb_input, idx in enumerate(seg_emb_inputs[seg_start:]):
+            seg_len = seg_emb_input.shape[1]
+            mask = paddle.tensor.triu((paddle.ones(
+                (seg_len, seg_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
+
+            # Output size [Batch, SegLen, HiddenDim]
+            output_seg, new_caches = self.decoder(seg_emb_inputs, l_memory, 
+                    tgt_mask=self.generate_sequare_subsequent_mask(tgt_inputs.shape[1]), 
+                    cache=caches["kv"])
+            caches["kv"] = new_caches
+            outputs.append(output_seg)
+
+            if(seg_emb_inputs.shape[1] >= self.segment_len):
+                # In case a seg is finished, update the cache
+                # Incremental cache needs to be refreshed
+                # Static cache needs to be recaclulated from long_term_memory
+                l_memory, _ = self.encoder(src_seg, l_memory)
+                caches["seg_id"] += 1
+                caches["memories"] = l_memory
+                caches["kv"] = self.decoder.gen_cache(l_memory)
+
+        outputs = paddle.concat(x=outputs,axis=1)
+
+        return output if cache is None else (output, new_caches)
 
     def _calc_logits(self, enc_out, tgt_idx=None):
         """Get the logits of generation task.
@@ -186,7 +280,7 @@ class RecursiveModels(Model):
         The network may share weight with token embeddings.
 
         Args:
-            enc_out: the output embeddings of PlasticRNN, shape is [batch_size, max_seq_len, hidden_dim]
+            enc_out: the output embeddings of Transformer, shape is [batch_size, max_seq_len, hidden_dim]
             tgt_idx (optional): the indices of prediction tokens, shape is [num_predictions, 2].
 
         Returns:
@@ -211,14 +305,20 @@ class RecursiveModels(Model):
             logits = self.lm_out_fc(seq_trans_feat)
         return logits
 
-
     def forward(self, inputs, is_infer=False):
         """Run model main forward."""
         outputs = {}
+        if is_infer:
+            self._generation_caches = self.gen_cache(inputs["token_ids"])
+        else:
+            self._generation_caches = None
+
         outputs["enc_out"] = self._generation_network(
             token_ids=inputs["token_ids"],
             type_ids=inputs["type_ids"],
-            role_ids=inputs.get("role_ids", None)
+            pos_ids=inputs["pos_ids"],
+            role_ids=inputs.get("role_ids", None),
+            generation_mask=inputs["generation_mask"]
         )
         return outputs
 
