@@ -17,6 +17,7 @@ import argparse
 from collections import defaultdict
 import json
 import os
+import sys
 import subprocess
 import time
 
@@ -78,7 +79,9 @@ def run_cmd(cmd):
 def train(args):
     """The main function of training."""
     if args.is_distributed:
-        fleet.init(is_collective=True)
+        strategy = fleet.DistributedStrategy()
+        strategy.find_unused_parameters = True
+        fleet.init(strategy=strategy, is_collective=True)
 
         dev_count = fluid.core.get_cuda_device_count()
         gpu_id = int(os.getenv("FLAGS_selected_gpus"))
@@ -118,6 +121,7 @@ def train(args):
     print("Training is start.")
     for step, data in enumerate(train_generator(), args.start_step + 1):
         outputs = task.train_step(model, data)
+        #print("outputs", outputs)
         timer.pause()
 
         if step % args.log_steps == 0:
@@ -131,6 +135,7 @@ def train(args):
             print(f"\tcurrent lr: {current_lr:.7f}")
             metrics = task.get_metrics(outputs)
             print("\t" + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
+            sys.stdout.flush()
             timer.reset()
 
         if step % args.validation_steps == 0:

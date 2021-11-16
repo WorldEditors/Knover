@@ -34,6 +34,10 @@ __all__ = []
 
 
 class RecFormerEncoderLayer(Layer):
+    """
+    RecFormer Encoder Layer
+    Takes the External Memory M_{t}^{L}, X_{t}^{L}, yield the External Memory in Next Step M_{t+1}^{L}, X_{t}^{L+1}
+    """
 
     def __init__(self,
                  d_model,
@@ -85,33 +89,49 @@ class RecFormerEncoderLayer(Layer):
         self.dropout2 = Dropout(dropout, mode="upscale_in_train")
         self.activation = getattr(F, activation)
 
-    def forward(self, src, memory):
+    def forward(self, src, memory, is_last_layer=False):
+        """
+        src: source to be encoded into the memory, should be tensor of size [Batch, SeqLen, Hidden]
+        memory: tensor of size [Batch, SegmentLen, Hidden]
+        is_last_layer: for the last layer we will not process the source token
+        """
         l_m = memory.shape[1]
         l_s = src.shape[1]
         concat_src = paddle.concat(x=[memory, src], axis=1)
         if self.normalize_before:
             concat_src = self.norm1(concat_src)
-        residual = concat_src
 
         # Add cache for encoder for the usage like UniLM
-        concat_src = self.self_attn(concat_src, concat_src, concat_src, None)
-        concat_src = residual + self.dropout1(concat_src)
+        if(not is_last_layer):
+            output = self.self_attn(concat_src, concat_src, concat_src, None)
+            residual = concat_src
+        else:
+            output = self.self_attn(memory, concat_src, concat_src, None)
+            residual = memory
+
+        output = residual + self.dropout1(output)
 
         if not self.normalize_before:
-            concat_src = self.norm1(concat_src)
+            output = self.norm1(output)
 
-        residual = concat_src
+        residual = output
         if self.normalize_before:
-            concat_src = self.norm2(concat_src)
-        concat_src = self.linear2(self.dropout(self.activation(self.linear1(concat_src))))
-        concat_src = residual + self.dropout2(concat_src)
+            output = self.norm2(output)
+
+        output = self.linear2(self.dropout(self.activation(self.linear1(output))))
+        output = residual + self.dropout2(output)
         if not self.normalize_before:
-            concat_src = self.norm2(concat_src)
-        return paddle.split(concat_src, [l_m, l_s], axis=1)
+            output = self.norm2(output)
+        #return M_{t+1}^{L}, X_{t}^{L+1} if L is not last layer else M_{t+1}^{L} only
+        return paddle.split(output, [l_m, l_s], axis=1) if (not is_last_layer) else output
 
 class RecFormerEncoder(Layer):
     """
     Define Recursive Encoder
+    Takes the External Memory M_{t}, X_{t}, yield the External Memory in Next Step M_{t+1}
+    M_{t}: A length "NumLayer" list of Tensor of Size [BatchSize, SegmentLength, Hidden]
+    X_{t}: input of size [Batch, SeqLength, Hidden]
+    M_{t+1}: The same shaped memory as M_{t} containing the information of X_t and M_t
     """
 
     def __init__(self, encoder_layer, num_layers):
@@ -130,9 +150,11 @@ class RecFormerEncoder(Layer):
 
         new_memories = []
         output = src
-        for i, mod in enumerate(self.layers):
+        for i, mod in enumerate(self.layers[:-1]):
             out_memory, output = mod(output, memories[i])
             new_memories.append(out_memory)
+        out_memory = self.layers[-1](output, memories[self.num_layers-1], is_last_layer=True)
+        new_memories.append(out_memory)
 
         return new_memories
 

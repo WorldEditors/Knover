@@ -86,14 +86,12 @@ class RecFormer(Model):
         self.hidden_act = args.hidden_act
         self.encoder_layer = RecFormerEncoderLayer(
             self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
-            act_dropout=0, normalize_before=self.normalize_before,
-            weight_attr=param_attr)
+            act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
         self.encoder = RecFormerEncoder(self.encoder_layer, self.n_layer)
 
         self.decoder_layer = TransformerDecoderLayer(
             self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
-            act_dropout=0, normalize_before=self.normalize_before,
-            weight_attr=param_attr)
+            act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
 
         if self.normalize_before:
             output_norm = nn.LayerNorm(self.hidden_size)
