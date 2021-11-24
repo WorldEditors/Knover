@@ -72,6 +72,9 @@ class DialogReader(object):
         group.add_argument("--sort_pool_size", type=int, default=2 ** 16,
                            help="The size of sorting pool. If it is positive, we will generate batches from sorted "
                            "example pool (containing X examples).")
+        group.add_argument("--is_autoregressive", type=str2bool, default=False,
+                           help="Whether to train the model in auto-regressive mode. Only evaluate tgt field "
+                           "in evaluation phase.")
 
         tokenizer_group = parser.add_argument_group("Tokenizer")
         tokenizer_group.add_argument("--tokenizer", type=str, default="SentencePieceTokenizer")
@@ -83,7 +86,6 @@ class DialogReader(object):
     def __init__(self, args):
         tokenizer_cls = getattr(tokenization, args.tokenizer)
         self.tokenizer = tokenizer_cls(args)
-        self.vocab = self.tokenizer.vocab
         self.pad_id = args.pad_id = self.tokenizer.pad_id
         self.bos_id = args.bos_id = self.tokenizer.bos_id
         self.eos_id = args.eos_id = self.tokenizer.eos_id
@@ -104,6 +106,7 @@ class DialogReader(object):
         self.sort_pool_size = args.sort_pool_size
         self.shuffle_pool_size = args.shuffle_pool_size
 
+        self.is_autoregressive = args.is_autoregressive
         self.reserve_example = args.get("reserve_example", False)
 
         if self.shuffle_pool_size > 0 and self.sort_pool_size > 0:
@@ -554,12 +557,17 @@ class DialogReader(object):
             elif phase.startswith("distributed"):
                 batch_reader = self._distributed_batch_reader(batch_reader, num_part, part_id, is_test=True)
 
-            for epoch_index in range(num_epochs):
-                if phase == "train":
-                    self.current_example = 0
-                    self.current_epoch = epoch_index + 1
-                for batch in batch_reader():
-                    yield self._pad_batch_records(batch, is_infer, phase=phase)
+            try:
+                for epoch_index in range(num_epochs):
+                    if phase == "train":
+                        self.current_example = 0
+                        self.current_epoch = epoch_index + 1
+                    for batch in batch_reader():
+                        yield self._pad_batch_records(batch, is_infer, phase=phase)
+            except:
+                import traceback
+                traceback.print_exc()
+                raise
 
         return __wrapper__
 
@@ -614,10 +622,13 @@ class DialogReader(object):
         if self.use_role:
             batch["role_ids"] = pad_batch_data(batch_role_ids, pad_id=0)
 
-        batch_tgt_start_idx = [record.tgt_start_idx for record in batch_records]
-        batch["generation_mask"] = self._gen_self_attn_mask(
-            batch_token_ids,
-            batch_tgt_start_idx=batch_tgt_start_idx)
+        if self.is_autoregressive:
+            batch_tgt_start_idx = [0 for record in batch_records]
+        else:
+            batch_tgt_start_idx = [record.tgt_start_idx for record in batch_records]
+            batch["generation_mask"] = self._gen_self_attn_mask(
+                batch_token_ids,
+                batch_tgt_start_idx=batch_tgt_start_idx)
 
         if is_infer:
             bsz = len(batch_token_ids)
@@ -626,17 +637,31 @@ class DialogReader(object):
                 batch["tgt_pos"] = np.array(batch_tgt_start_idx, dtype="int64").reshape(-1, 1)
             else:
                 batch["tgt_pos"] = np.zeros_like(batch_tgt_start_idx, dtype="int64").reshape(-1, 1)
-            batch["tgt_generation_mask"] = batch["generation_mask"][:, :1, :]
+            if not self.is_autoregressive:
+                # TODO: fix the usage of `tgt_generation_mask` in generator.
+                batch["tgt_generation_mask"] = batch["generation_mask"][:, :1, :]
             batch_data_id = [record.data_id for record in batch_records]
             batch["data_id"] = np.array(batch_data_id).astype("int64")
         else:
-            batch["tgt_label"], batch["tgt_idx"] = mask(
-                batch_tokens=batch_token_ids,
-                vocab_size=self.vocab_size,
-                tgt_starts=batch_tgt_start_idx,
-                bos_id=self.bos_id,
-                eos_id=self.eos_id,
-                mask_id=self.mask_id,
-                is_unidirectional=True)
+            if self.is_autoregressive and phase and "valid" in phase:
+                batch_tgt_start_idx = [record.tgt_start_idx for record in batch_records]
+            if self.is_autoregressive:
+                batch["tgt_label"] = batch["token_ids"][:, 1:]
+                ones = np.ones_like(batch["token_ids"])
+                tokens_idx = np.cumsum(ones, axis=1) - ones
+                loss_mask = np.logical_and(
+                    tokens_idx[:, 1:] < np.expand_dims(list(map(len, batch_token_ids)), 1),
+                    tokens_idx[:, 1:] >= np.expand_dims(batch_tgt_start_idx, 1)
+                ).astype("float32")
+                batch["loss_mask"] = loss_mask
+            else:
+                batch["tgt_label"], batch["tgt_idx"] = mask(
+                    batch_tokens=batch_token_ids,
+                    vocab_size=self.vocab_size,
+                    tgt_starts=batch_tgt_start_idx,
+                    bos_id=self.bos_id,
+                    eos_id=self.eos_id,
+                    mask_id=self.mask_id,
+                    is_unidirectional=True)
 
         return batch

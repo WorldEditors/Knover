@@ -156,9 +156,12 @@ class UnifiedTransformer(Model):
         if self.input_norm is not None:
             emb_out = self.input_norm(emb_out)
 
-        # generate n-head self-attention mask
-        attn_bias = paddle.scale(x=input_mask, scale=1e4, bias=-1.0, bias_after_scale=False)
-        attn_bias = paddle.unsqueeze(attn_bias, [1])
+        if input_mask is not None:
+            # generate n-head self-attention mask
+            attn_bias = paddle.scale(x=input_mask, scale=1e4, bias=-1.0, bias_after_scale=False)
+            attn_bias = paddle.unsqueeze(attn_bias, [1])
+        else:
+            attn_bias = None
 
         return emb_out, attn_bias
 
@@ -232,7 +235,7 @@ class UnifiedTransformer(Model):
             logits: the logits of prediction task, shape is [num_predictions, vocab_size].
         """
         if tgt_idx is None:
-            seq_feat = paddle.reshape(x=enc_out, shape=[-1, self.hidden_size])
+            seq_feat = enc_out
         elif len(tgt_idx.shape) == 2 and tgt_idx.shape[1] == 2:
             seq_feat = paddle.gather_nd(enc_out, tgt_idx)
         else:
@@ -263,7 +266,7 @@ class UnifiedTransformer(Model):
             type_ids=inputs["type_ids"],
             pos_ids=inputs["pos_ids"],
             role_ids=inputs.get("role_ids", None),
-            generation_mask=inputs["generation_mask"]
+            generation_mask=inputs.get("generation_mask", None)
         )
         return outputs
 
@@ -271,8 +274,13 @@ class UnifiedTransformer(Model):
         """Get metrics."""
         metrics = {}
 
-        tgt_logits = self._calc_logits(outputs["enc_out"], inputs["tgt_idx"])
-        mean_tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"])
+        if "tgt_idx" in inputs:
+            tgt_logits = self._calc_logits(outputs["enc_out"], inputs["tgt_idx"])
+            mean_tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"])
+        else:
+            tgt_logits = self._calc_logits(outputs["enc_out"])
+            tgt_lm_loss = F.cross_entropy(tgt_logits[:, :-1], inputs["tgt_label"], reduction="none")
+            mean_tgt_lm_loss = paddle.sum(tgt_lm_loss * inputs["loss_mask"]) / (paddle.sum(inputs["loss_mask"]) + 1e-8)
         metrics["token_lm_loss"] = mean_tgt_lm_loss
 
         loss = mean_tgt_lm_loss
