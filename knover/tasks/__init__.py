@@ -59,3 +59,4 @@ def add_cmdline_args(parser):
 
 
 import knover.tasks.dialog_generation
+import knover.tasks.mem_aug_generation

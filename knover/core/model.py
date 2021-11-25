@@ -222,6 +222,7 @@ class Model(ABC, nn.Layer, metaclass=ModelMeta):
         return
 
     def _get_lr_scheduler(self, args):
+        print("lr scheduler", args.lr_scheduler)
         if args.lr_scheduler == "noam" and args.warmup_steps <= 0:
             print("[WARMING] Using constant learning rate because of `warmup_steps` is not positive while using NoamScheduler.")
         if args.lr_scheduler == "noam" and args.warmup_steps > 0:
@@ -376,8 +377,12 @@ class ModelInterface(object):
         if args.is_distributed:
             # distributed settings for dygraph.
             # now only support data parallel for dygraph.
+            #strategy = fleet.DistributedStrategy()
+            #strategy.find_unused_parameters = True
+            #fleet.init(strategy=strategy)
             self.model.optimizer = fleet.distributed_optimizer(self.model.optimizer)
             self.dp_model = fleet.distributed_model(self.model)
+            #self.dp_model = paddle.DataParallel(self.model, find_unused_parameters=True)
 
     def _get_outputs(self, outputs):
         """Convert Tensors into numpy arrays.

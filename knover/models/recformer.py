@@ -201,18 +201,6 @@ class RecFormer(Model):
         logits = self._calc_logits(enc_out)
         return logits
 
-    def gen_cache(self, inputs):
-        batch_size = emb_input.shape[0]
-        seq_len = emb_input.shape[1]
-
-        caches = dict()
-        caches["seg_id"] = 0
-        caches["memories"] = [paddle.full(
-                shape=[batch_size, self.segment_len, self.hidden_size], 
-                fill_value=0, dtype=emb_input.dtype)] * self.n_layer
-        caches["kv"] = self.decoder.gen_cache(caches["memories"])
-        return caches
-
     def _encode(self, emb_input, n_head_self_attn_mask, caches=None):
         """Run Transformer encode pass.
 
@@ -229,53 +217,26 @@ class RecFormer(Model):
             The output embeddings of Transformer.
         """
         batch_size = emb_input.shape[0]
-        seq_len = emb_input.shape[1]
+        seg_len = emb_input.shape[1]
 
+        mask = paddle.tensor.triu((paddle.ones(
+            (seg_len, seg_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
+
+        # Output size [Batch, SegLen, HiddenDim]
         if(caches is not None):
-            l_memories = caches["memories"]
+            outputs, caches = self.decoder(emb_input, self.memories, 
+                    tgt_mask=mask,cache=caches)
         else:
-            l_memories = [paddle.full(shape=[batch_size, self.segment_len, self.hidden_size], 
-                    fill_value=0, dtype=emb_input.dtype)] * self.n_layer
-        seg_num = (seq_len - 1) // self.segment_len + 1
-        seg_len_list = [self.segment_len] * seg_num
-        seg_len_list[-1] -= self.segment_len * seg_num - seq_len
-        seg_emb_inputs = paddle.split(emb_input, seg_len_list, axis=1)
-        if(caches is not None):
-            seg_start = caches["seg_id"]
+            outputs = self.decoder(emb_input, self.memories, tgt_mask=mask)
+
+        if(self.inner_recursion_cnt % self.detach_interval == 0):
+            self.memories = self.encoder(emb_input, self.memories.detach())
+            self.inner_recursion_cnt = 1
         else:
-            seg_start = 0
-        
-        outputs = []
-        for idx, seg_emb_input in enumerate(seg_emb_inputs[seg_start:]):
-            seg_len = seg_emb_input.shape[1]
-            mask = paddle.tensor.triu((paddle.ones(
-                (seg_len, seg_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
+            self.memories = self.encoder(emb_input, self.memories)
+            self.inner_recursion_cnt += 1
 
-            # Output size [Batch, SegLen, HiddenDim]
-            if(caches is not None):
-                output_seg, new_caches = self.decoder(seg_emb_input, l_memories, 
-                        tgt_mask=mask,cache=caches["kv"])
-                # Update Caches
-                caches["kv"] = new_caches
-            else:
-                output_seg = self.decoder(seg_emb_input, l_memories, 
-                        tgt_mask=mask)
-
-            outputs.append(output_seg)
-
-            if(seg_emb_input.shape[1] >= self.segment_len):
-                # In case a seg is finished, re-initialize the cache all over again
-                # Incremental cache needs to be refreshed
-                # Static cache needs to be recaclulated from long_term_memory
-                l_memories = self.encoder(seg_emb_input, l_memories)
-                if(caches is not None):
-                    caches["seg_id"] += 1
-                    caches["memories"] = l_memories
-                    caches["kv"] = self.decoder.gen_cache(l_memories)
-
-        outputs = paddle.concat(x=outputs,axis=1)
-
-        return outputs if caches is None else (output, new_caches)
+        return outputs if caches is None else (output, caches)
 
     def _calc_logits(self, enc_out, tgt_idx=None):
         """Get the logits of generation task.
@@ -312,7 +273,7 @@ class RecFormer(Model):
         """Run model main forward."""
         outputs = {}
         if is_infer:
-            self._generation_caches = self.gen_cache(inputs["token_ids"])
+            self._generation_caches = self.decoder.gen_cache(self.memories)
         else:
             self._generation_caches = None
 
@@ -376,3 +337,9 @@ class RecFormer(Model):
             return predictions
         else:
             raise NotImplementedError
+
+    def reset_memories(self, batch_size, segment_size=128, detach_interval=1):
+        self.detach_interval = detach_interval
+
+        self.memories = [paddle.full(shape=[batch_size, segment_len, self.hidden_size], fill_value=0.0)] * self.n_layer
+        self.inner_recursion_cnt = 1

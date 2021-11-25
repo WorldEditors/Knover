@@ -110,8 +110,8 @@ def train(args):
     valid_generator = task.get_data_loader(
         model,
         input_file=args.valid_file,
-        num_part=dev_count,
-        part_id=gpu_id,
+        num_part=1, #dev_count,
+        part_id=0, #gpu_id,
         phase="distributed_valid" if args.is_distributed else "valid"
     )
 
