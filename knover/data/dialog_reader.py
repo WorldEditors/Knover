@@ -103,6 +103,7 @@ class DialogReader(object):
         self.position_style = args.position_style
         self.sort_pool_size = args.sort_pool_size
         self.shuffle_pool_size = args.shuffle_pool_size
+        self.need_mask = args.get("need_mask", True)
 
         self.reserve_example = args.get("reserve_example", False)
 
@@ -611,9 +612,11 @@ class DialogReader(object):
             batch["role_ids"] = pad_batch_data(batch_role_ids, pad_id=0)
 
         batch_tgt_start_idx = [record.tgt_start_idx for record in batch_records]
-        batch["generation_mask"] = self._gen_self_attn_mask(
-            batch_token_ids,
-            batch_tgt_start_idx=batch_tgt_start_idx)
+        # only generating mask when mask is needed
+        if(self.need_mask):
+            batch["generation_mask"] = self._gen_self_attn_mask(
+                batch_token_ids,
+                batch_tgt_start_idx=batch_tgt_start_idx)
 
         if is_infer:
             bsz = len(batch_token_ids)

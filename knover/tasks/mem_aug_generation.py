@@ -40,6 +40,18 @@ class MemAugGeneration(DialogGeneration):
                 help="every that much segments detach the memory")
         DialogGeneration.add_cmdline_args(parser)
 
+    def split_inputs(self, inputs):
+        batch_size = inputs.shape[0]
+        all_seq_len = inputs.shape[1]
+
+        #Split Inputs into segments
+        seg_num = (all_seq_len - 1) // self.segment_len + 1
+        seg_len_list = [self.segment_len] * seg_num
+        seg_len_list[-1] -= self.segment_len * seg_num - all_seq_len
+        seg_inputs = paddle.split(inputs, seg_len_list, axis=1)
+
+        all_token_num = sum(seg_len_list)
+
     def train_step(self, model: ModelInterface, inputs):
         """Run one training step."""
 
