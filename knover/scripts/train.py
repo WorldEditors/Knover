@@ -79,7 +79,9 @@ def run_cmd(cmd):
 def train(args):
     """The main function of training."""
     if args.is_distributed:
-        fleet.init(is_collective=True)
+        strategy = fleet.DistributedStrategy()
+        strategy.find_unused_parameters = True
+        fleet.init(strategy=strategy, is_collective=True)
 
         dev_count = fluid.core.get_cuda_device_count()
         gpu_id = int(os.getenv("FLAGS_selected_gpus"))
