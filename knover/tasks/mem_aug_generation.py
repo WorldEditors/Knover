@@ -48,23 +48,21 @@ class MemAugGeneration(DialogGeneration):
         seg_num = (all_seq_len - 1) // self.segment_len + 1
         seg_len_list = [self.segment_len] * seg_num
         seg_len_list[-1] -= self.segment_len * seg_num - all_seq_len
-        seg_inputs = paddle.split(inputs, seg_len_list, axis=1)
+        # Split [Bacth, SeqLen] to [Batch, SegLen]
+        seg_inputs_token_id = paddle.split(inputs["token_ids"], seg_len_list, axis=1)
+        seg_inputs_type_id = paddle.split(inputs["type_ids"], seg_len_list, axis=1)
+        seg_inputs_pos_id = paddle.split(inputs["pos_ids"], seg_len_list, axis=1)
+        seg_inputs_role_id = paddle.split(inputs["role_ids"], seg_len_list, axis=1)
+        # Split [Bacth, SeqLen, 2] to [Batch, SegLen, 2]
+        seg_inputs_tgt_idx = paddle.split(inputs["tgt_idx"], seg_len_list, axis=1)
+        seg_inputs_tgt_label = paddle.split(inputs["tgt_label"], seg_len_list, axis=1)
 
         all_token_num = sum(seg_len_list)
+        return batch_size, all_token_num, seg_inputs
 
     def train_step(self, model: ModelInterface, inputs):
         """Run one training step."""
-
-        batch_size = inputs.shape[0]
-        all_seq_len = inputs.shape[1]
-
-        #Split Inputs into segments
-        seg_num = (all_seq_len - 1) // self.segment_len + 1
-        seg_len_list = [self.segment_len] * seg_num
-        seg_len_list[-1] -= self.segment_len * seg_num - all_seq_len
-        seg_inputs = paddle.split(inputs, seg_len_list, axis=1)
-
-        all_token_num = sum(seg_len_list)
+        batch_size, all_token_num, seg_inputs = self.split_inputs(inputs)
         
         model.reset_memories(batch_size, self.segment_length, self.detach_interval)
         fin_outputs = {"token_lm_loss": 0.0, "loss": 0.0}
@@ -81,16 +79,7 @@ class MemAugGeneration(DialogGeneration):
 
     def eval_step(self, model: ModelInterface, inputs):
         """Run one evaluation step"""
-        batch_size = inputs.shape[0]
-        all_seq_len = inputs.shape[1]
-
-        #Split Inputs into segments
-        seg_num = (all_seq_len - 1) // self.segment_len + 1
-        seg_len_list = [self.segment_len] * seg_num
-        seg_len_list[-1] -= self.segment_len * seg_num - all_seq_len
-        seg_inputs = paddle.split(inputs, seg_len_list, axis=1)
-        
-        all_token_num = sum(seg_len_list)
+        batch_size, all_token_num, seg_inputs = self.split_inputs(inputs)
 
         model.reset_memories(batch_size, self.segment_length, self.detach_interval)
         fin_outputs = {"token_lm_loss": 0.0, "loss": 0.0, "batch_size": 0, "tokens_num": 0}
@@ -109,15 +98,8 @@ class MemAugGeneration(DialogGeneration):
 
     def infer_step(self, model: ModelInterface, inputs):
         """Run one inference step."""
-        batch_size = inputs.shape[0]
-        all_seq_len = inputs.shape[1]
+        batch_size, all_token_num, seg_inputs = self.split_inputs(inputs)
 
-        #Split Inputs into segments
-        seg_num = (all_seq_len - 1) // self.segment_len + 1
-        seg_len_list = [self.segment_len] * seg_num
-        seg_len_list[-1] -= self.segment_len * seg_num - all_seq_len
-        seg_inputs = paddle.split(inputs, seg_len_list, axis=1)
-        
         model.reset_memories(batch_size, self.segment_length, self.detach_interval)
         for idx, seg_input in enumerate(seg_inputs):
             #avoiding large memories, do some detach
