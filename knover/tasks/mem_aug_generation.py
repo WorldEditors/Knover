@@ -18,13 +18,15 @@ import math
 
 from knover.core.task import Task
 from knover.tasks.dialog_generation import DialogGeneration
+from knover.tasks import register_task
+from knover.core.model import ModelInterface
 
 
 @register_task("MemAugGeneration")
 class MemAugGeneration(DialogGeneration):
     """Define XL dialogue response generation task."""
     def __init__(self, args):
-        super(RecursiveGeneration, self).__init__(args)
+        super(MemAugGeneration, self).__init__(args)
         self.detach_interval = args.detach_interval
         self.segment_length = args.segment_length
         self.memories = None
@@ -34,28 +36,40 @@ class MemAugGeneration(DialogGeneration):
     def add_cmdline_args(cls, parser):
         """Add cmdline arguments."""
         group = parser.add_argument_group("Task")
-        group.add_arguement("--segment_length", type=int, default=128,
+        group.add_argument("--segment_length", type=int, default=128,
                 help="length of each segments")
-        group.add_arguement("--detach_interval", type=int, default=1,
+        group.add_argument("--detach_interval", type=int, default=1,
                 help="every that much segments detach the memory")
         DialogGeneration.add_cmdline_args(parser)
 
     def split_inputs(self, inputs):
         batch_size = inputs.shape[0]
-        all_seq_len = inputs.shape[1]
+        # In auto-regressive tasks, the sequence length is reduced by 1 (starting from 1)
+        all_seq_len = inputs.shape[1] - 1
 
         #Split Inputs into segments
         seg_num = (all_seq_len - 1) // self.segment_len + 1
         seg_len_list = [self.segment_len] * seg_num
         seg_len_list[-1] -= self.segment_len * seg_num - all_seq_len
         # Split [Bacth, SeqLen] to [Batch, SegLen]
-        seg_inputs_token_id = paddle.split(inputs["token_ids"], seg_len_list, axis=1)
-        seg_inputs_type_id = paddle.split(inputs["type_ids"], seg_len_list, axis=1)
-        seg_inputs_pos_id = paddle.split(inputs["pos_ids"], seg_len_list, axis=1)
-        seg_inputs_role_id = paddle.split(inputs["role_ids"], seg_len_list, axis=1)
-        # Split [Bacth, SeqLen, 2] to [Batch, SegLen, 2]
-        seg_inputs_tgt_idx = paddle.split(inputs["tgt_idx"], seg_len_list, axis=1)
-        seg_inputs_tgt_label = paddle.split(inputs["tgt_label"], seg_len_list, axis=1)
+        seg_inputs_token_id = paddle.split(inputs["token_ids"][:-1], seg_len_list, axis=1)
+        seg_inputs_type_id = paddle.split(inputs["type_ids"][:-1], seg_len_list, axis=1)
+        seg_inputs_pos_id = paddle.split(inputs["pos_ids"][:-1], seg_len_list, axis=1)
+        seg_inputs_role_id = paddle.split(inputs["role_ids"][:-1], seg_len_list, axis=1)
+        # Split [Bacth, SeqLen] to [Batch, SegLen]
+        if("loss_mask" in inputs):
+            seg_inputs_loss_mask = paddle.split(inputs["loss_mask"], seg_len_list, axis=1)
+            seg_inputs_tgt_label = paddle.split(inputs["tgt_label"], seg_len_list, axis=1)
+        seg_inputs = list()
+        for i in range(len(seg_len_list)):
+            seg_inputs.append(dict())
+            seg_inputs[-1]["token_ids"] = seg_inputs_token_id[i]
+            seg_inputs[-1]["type_ids"] = seg_inputs_type_id[i]
+            seg_inputs[-1]["pos_ids"] = [paddle.arange(seg_len_list[i])] * batch_size
+            seg_inputs[-1]["role_ids"] = seg_inputs_role_id[i]
+            if("loss_mask" in inputs):
+                seg_inputs[-1]["loss_mask"] = seg_inputs_loss_mask[i]
+                seg_inputs[-1]["tgt_label"] = seg_inputs_tgt_label[i]
 
         all_token_num = sum(seg_len_list)
         return batch_size, all_token_num, seg_inputs

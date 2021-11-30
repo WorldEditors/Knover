@@ -58,5 +58,5 @@ def add_cmdline_args(parser):
     TASK_REGISTRY[args.task].add_cmdline_args(parser)
     return group
 
-
 import knover.tasks.dialog_generation
+import knover.tasks.mem_aug_generation

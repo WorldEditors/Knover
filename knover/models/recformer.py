@@ -121,7 +121,6 @@ class RecFormer(Model):
                    type_ids,
                    pos_ids,
                    role_ids,
-                   input_mask,
                    aux_emb=None):
         """Generate input embeddings of Transformer
 
@@ -129,8 +128,6 @@ class RecFormer(Model):
             tokens_ids: represents the token id of each token, shape is [batch_size, max_seq_len, 1]
             type_ids: represents the type of each token, shape is [batch_size, max_seq_len, 1]
             pos_ids: represents the position of each token, shape is [batch_size, max_seq_len, 1]
-            input_mask: represents the attention masking mastrix in each Transformer blocks,
-                shape is [batch_size, max_seq_len, max_seq_len]
             aux_emb: represents the auxiliary input embeddings of Transformer.
 
         Returns:
@@ -152,18 +149,13 @@ class RecFormer(Model):
         if self.emb_mapping_in:
             emb_out = self.emb_mapping_fc(emb_out)
 
-        # generate n-head self-attention mask
-        self_attn_mask = paddle.scale(x=input_mask, scale=1e4, bias=-1.0, bias_after_scale=False)
-        n_head_self_attn_mask = paddle.unsqueeze(self_attn_mask, [1])
-
-        return emb_out, n_head_self_attn_mask
+        return emb_out
 
     def _generation_network(self,
                             token_ids,
                             type_ids,
                             pos_ids,
                             role_ids,
-                            generation_mask,
                             aux_emb=None):
         """Run Transformer generation network.
 
@@ -171,20 +163,18 @@ class RecFormer(Model):
             tokens_ids: represents the token id of each token, shape is [batch_size, max_seq_len, 1]
             type_ids: represents the type of each token, shape is [batch_size, max_seq_len, 1]
             pos_ids: represents the position of each token, shape is [batch_size, max_seq_len, 1]
-            input_mask: represents the attention masking mastrix in each Transformer blocks,
-                shape is [batch_size, max_seq_len, max_seq_len]
             aux_emb: represents the auxiliary input embeddings of Transformer.
 
         Returns:
             The output embeddings of Transformer.
         """
-        emb_input, n_head_self_attn_mask = self._gen_input(
-            token_ids, type_ids, pos_ids, role_ids, generation_mask, aux_emb=aux_emb)
+        emb_input = self._gen_input(
+            token_ids, type_ids, pos_ids, role_ids, aux_emb=aux_emb)
         if self._generation_caches is None:
-            enc_out =  self._encode(emb_input, n_head_self_attn_mask)
+            enc_out =  self._encode(emb_input)
         else:
             enc_out, self._generation_caches = self._encode(
-                emb_input, n_head_self_attn_mask, self._generation_caches)
+                emb_input, self._generation_caches)
         return enc_out
 
     def _generation_step(self, state):
@@ -196,18 +186,15 @@ class RecFormer(Model):
             state["type_ids"],
             state["pos_ids"],
             state.get("role_ids", None),
-            state["tgt_generation_mask"],
         )
         logits = self._calc_logits(enc_out)
         return logits
 
-    def _encode(self, emb_input, n_head_self_attn_mask, caches=None):
+    def _encode(self, emb_input, caches=None):
         """Run Transformer encode pass.
 
         Args:
             emb_input: represents the input embeddings fo Transformer, shape is [batch_size, max_seq_len, hidden_dim]
-            n_head_self_attn_mask: represents the attention masking matrix,
-                shape is [batch_size, num_heads, max_seq_len, max_seq_len]
             caches: Dict of {"seg_id": n_seg_id,
                 "memories": long_term_memories,
                 "kv": key_value_cache_for_decoder
@@ -251,7 +238,7 @@ class RecFormer(Model):
             logits: the logits of prediction task, shape is [num_predictions, vocab_size].
         """
         if tgt_idx is None:
-            seq_feat = paddle.reshape(x=enc_out, shape=[-1, self.hidden_size])
+            seq_feat = enc_out
         elif len(tgt_idx.shape) == 2 and tgt_idx.shape[1] == 2:
             seq_feat = paddle.gather_nd(enc_out, tgt_idx)
         else:
@@ -282,7 +269,6 @@ class RecFormer(Model):
             type_ids=inputs["type_ids"],
             pos_ids=inputs["pos_ids"],
             role_ids=inputs.get("role_ids", None),
-            generation_mask=inputs["generation_mask"]
         )
         return outputs
 
@@ -290,8 +276,13 @@ class RecFormer(Model):
         """Get metrics."""
         metrics = {}
 
-        tgt_logits = self._calc_logits(outputs["enc_out"], inputs["tgt_idx"])
-        mean_tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"])
+        if "tgt_idx" in inputs:
+            tgt_logits = self._calc_logits(outputs["enc_out"], inputs["tgt_idx"])
+            mean_tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"])
+        else:
+            tgt_logits = self._calc_logits(outputs["enc_out"])
+            tgt_lm_loss = F.cross_entropy(tgt_logits[:, :-1], inputs["tgt_label"], reduction="none")
+            mean_tgt_lm_loss = paddle.sum(tgt_lm_loss * inputs["loss_mask"]) / (paddle.sum(inputs["loss_mask"]) + 1e-8)
         metrics["token_lm_loss"] = mean_tgt_lm_loss
 
         loss = mean_tgt_lm_loss
