@@ -307,7 +307,7 @@ class Model(nn.Layer, metaclass=ModelMeta):
             inputs: A dict mapping keys to corresponding Tensors.
         """
         if isinstance(inputs, dict):
-            return {k: paddle.Tensor(v) for k, v in inputs.items()}
+            return {k: v if paddle.is_tensor(v) else paddle.Tensor(v) for k, v in inputs.items()}
         if is_infer:
             return dict(zip(self.infer_feed_names, inputs))
         else:

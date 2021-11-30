@@ -210,18 +210,14 @@ class RecFormer(Model):
             (seg_len, seg_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
 
         # Output size [Batch, SegLen, HiddenDim]
+        detached_memories = [memory.detach() for memory in self.memories]
         if(caches is not None):
-            outputs, caches = self.decoder(emb_input, self.memories, 
+            outputs, caches = self.decoder(emb_input, detached_memories, 
                     tgt_mask=mask,cache=caches)
         else:
-            outputs = self.decoder(emb_input, self.memories, tgt_mask=mask)
+            outputs = self.decoder(emb_input, detached_memories, tgt_mask=mask)
 
-        if(self.inner_recursion_cnt % self.detach_interval == 0):
-            self.memories = self.encoder(emb_input, self.memories.detach())
-            self.inner_recursion_cnt = 1
-        else:
-            self.memories = self.encoder(emb_input, self.memories)
-            self.inner_recursion_cnt += 1
+        self.memories = self.encoder(emb_input, detached_memories)
 
         return outputs if caches is None else (output, caches)
 
@@ -281,7 +277,7 @@ class RecFormer(Model):
             mean_tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"])
         else:
             tgt_logits = self._calc_logits(outputs["enc_out"])
-            tgt_lm_loss = F.cross_entropy(tgt_logits[:, :-1], inputs["tgt_label"], reduction="none")
+            tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"], reduction="none")
             mean_tgt_lm_loss = paddle.sum(tgt_lm_loss * inputs["loss_mask"]) / (paddle.sum(inputs["loss_mask"]) + 1e-8)
         metrics["token_lm_loss"] = mean_tgt_lm_loss
 
@@ -329,8 +325,5 @@ class RecFormer(Model):
         else:
             raise NotImplementedError
 
-    def reset_memories(self, batch_size, segment_size=128, detach_interval=1):
-        self.detach_interval = detach_interval
-
-        self.memories = [paddle.full(shape=[batch_size, segment_len, self.hidden_size], fill_value=0.0)] * self.n_layer
-        self.inner_recursion_cnt = 1
+    def reset_memories(self, batch_size, segment_size=128):
+        self.memories = [paddle.full(shape=[batch_size, segment_size, self.hidden_size], fill_value=0.0)] * self.n_layer

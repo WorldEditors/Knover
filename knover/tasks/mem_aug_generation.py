@@ -15,6 +15,8 @@
 
 from collections import defaultdict
 import math
+import paddle
+import numpy as np
 
 from knover.core.task import Task
 from knover.tasks.dialog_generation import DialogGeneration
@@ -43,42 +45,48 @@ class MemAugGeneration(DialogGeneration):
         DialogGeneration.add_cmdline_args(parser)
 
     def split_inputs(self, inputs):
-        batch_size = inputs.shape[0]
+        batch_size = inputs["token_ids"].shape[0]
         # In auto-regressive tasks, the sequence length is reduced by 1 (starting from 1)
-        all_seq_len = inputs.shape[1] - 1
+        all_seq_len = inputs["token_ids"].shape[1] - 1
 
         #Split Inputs into segments
-        seg_num = (all_seq_len - 1) // self.segment_len + 1
-        seg_len_list = [self.segment_len] * seg_num
-        seg_len_list[-1] -= self.segment_len * seg_num - all_seq_len
+        seg_num = (all_seq_len - 1) // self.segment_length + 1
+        seg_len_list = [self.segment_length] * seg_num
+        seg_len_list[-1] -= self.segment_length * seg_num - all_seq_len
         # Split [Bacth, SeqLen] to [Batch, SegLen]
-        seg_inputs_token_id = paddle.split(inputs["token_ids"][:-1], seg_len_list, axis=1)
-        seg_inputs_type_id = paddle.split(inputs["type_ids"][:-1], seg_len_list, axis=1)
-        seg_inputs_pos_id = paddle.split(inputs["pos_ids"][:-1], seg_len_list, axis=1)
-        seg_inputs_role_id = paddle.split(inputs["role_ids"][:-1], seg_len_list, axis=1)
+        seg_inputs_token_id = paddle.split(inputs["token_ids"][:, :-1], seg_len_list, axis=1)
+        seg_inputs_type_id = paddle.split(inputs["type_ids"][:, :-1], seg_len_list, axis=1)
+        has_role_ids = False
+        has_tgt_label = False
+        if("role_ids" in inputs):
+            seg_inputs_role_id = paddle.split(inputs["role_ids"][:, :-1], seg_len_list, axis=1)
+            has_role_ids = True
         # Split [Bacth, SeqLen] to [Batch, SegLen]
         if("loss_mask" in inputs):
             seg_inputs_loss_mask = paddle.split(inputs["loss_mask"], seg_len_list, axis=1)
             seg_inputs_tgt_label = paddle.split(inputs["tgt_label"], seg_len_list, axis=1)
+            has_tgt_label = True
         seg_inputs = list()
         for i in range(len(seg_len_list)):
             seg_inputs.append(dict())
             seg_inputs[-1]["token_ids"] = seg_inputs_token_id[i]
             seg_inputs[-1]["type_ids"] = seg_inputs_type_id[i]
-            seg_inputs[-1]["pos_ids"] = [paddle.arange(seg_len_list[i])] * batch_size
-            seg_inputs[-1]["role_ids"] = seg_inputs_role_id[i]
-            if("loss_mask" in inputs):
+            seg_inputs[-1]["pos_ids"] = paddle.to_tensor([paddle.arange(seg_len_list[i])] * batch_size)
+            if(has_role_ids):
+                seg_inputs[-1]["role_ids"] = seg_inputs_role_id[i]
+            if(has_tgt_label):
                 seg_inputs[-1]["loss_mask"] = seg_inputs_loss_mask[i]
                 seg_inputs[-1]["tgt_label"] = seg_inputs_tgt_label[i]
 
         all_token_num = sum(seg_len_list)
-        return batch_size, all_token_num, seg_inputs
+        return batch_size, all_token_num, seg_inputs, seg_len_list
 
     def train_step(self, model: ModelInterface, inputs):
         """Run one training step."""
-        batch_size, all_token_num, seg_inputs = self.split_inputs(inputs)
+        inputs = dict(zip(model.model.feed_names, inputs))
+        batch_size, all_token_num, seg_inputs, seg_len_list = self.split_inputs(inputs)
         
-        model.reset_memories(batch_size, self.segment_length, self.detach_interval)
+        model.model.reset_memories(batch_size, self.segment_length)
         fin_outputs = {"token_lm_loss": 0.0, "loss": 0.0}
         for idx, seg_input in enumerate(seg_inputs):
             #avoiding large memories, do some detach
@@ -86,6 +94,7 @@ class MemAugGeneration(DialogGeneration):
             token_num = seg_len_list[idx]
             fin_outputs["token_lm_loss"] += token_num / all_token_num * outputs["token_lm_loss"]
             fin_outputs["loss"] += token_num / all_token_num * outputs["loss"]
+        fin_outputs["scheduled_lr"] = outputs["scheduled_lr"]
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
                    for k, v in fin_outputs.items()}
@@ -93,9 +102,10 @@ class MemAugGeneration(DialogGeneration):
 
     def eval_step(self, model: ModelInterface, inputs):
         """Run one evaluation step"""
-        batch_size, all_token_num, seg_inputs = self.split_inputs(inputs)
+        inputs = dict(zip(model.model.feed_names, inputs))
+        batch_size, all_token_num, seg_inputs, seg_len_list = self.split_inputs(inputs)
 
-        model.reset_memories(batch_size, self.segment_length, self.detach_interval)
+        model.model.reset_memories(batch_size, self.segment_length)
         fin_outputs = {"token_lm_loss": 0.0, "loss": 0.0, "batch_size": 0, "tokens_num": 0}
         for idx, seg_input in enumerate(seg_inputs):
             #avoiding large memories, do some detach
@@ -112,9 +122,10 @@ class MemAugGeneration(DialogGeneration):
 
     def infer_step(self, model: ModelInterface, inputs):
         """Run one inference step."""
-        batch_size, all_token_num, seg_inputs = self.split_inputs(inputs)
+        inputs = dict(zip(model.model.feed_names, inputs))
+        batch_size, all_token_num, seg_inputs, seg_len_list = self.split_inputs(inputs)
 
-        model.reset_memories(batch_size, self.segment_length, self.detach_interval)
+        model.model.reset_memories(batch_size, self.segment_length)
         for idx, seg_input in enumerate(seg_inputs):
             #avoiding large memories, do some detach
             predictions = model.infer_step(seg_input)
