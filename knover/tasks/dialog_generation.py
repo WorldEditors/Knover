@@ -185,7 +185,6 @@ class DialogGeneration(Task):
         Returns:
             Return merged output which contains metrics and statistics.
         """
-        print(outputs, part_outputs)
         if outputs is None:
             return part_outputs
 
