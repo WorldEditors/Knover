@@ -20,6 +20,8 @@ import os
 import subprocess
 import time
 
+#import expt
+import paddle
 import numpy as np
 import paddle.fluid as fluid
 from paddle.distributed import fleet
@@ -28,10 +30,13 @@ import knover.models as models
 import knover.tasks as tasks
 from knover.utils import check_cuda, parse_args, str2bool, Timer
 
+use_vdl = False
 
 def setup_args():
     """Setup training arguments."""
     parser = argparse.ArgumentParser()
+    parser.add_argument("--use_k8s", type=str2bool, default=False,
+                        help="Whether to run on k8s cluster.")
     parser.add_argument("--is_distributed", type=str2bool, default=False,
                         help="Whether to run distributed training.")
     parser.add_argument("--save_path", type=str, default="output",
@@ -123,6 +128,13 @@ def train(args):
             phase="distributed_valid" if args.is_distributed else "valid"
         ))
 
+    # setup VDL and expt
+    global use_vdl
+    use_vdl = args.use_k8s and trainer_id == 0
+    if use_vdl:
+        expt.init(name=os.getenv("EXPT_NAME", "DEBUG"))
+        expt.set_params(args.Model)
+
     # maintain best metric (init)
     best_metric = -1e10
     if args.eval_metric.startswith("-"):
@@ -152,6 +164,15 @@ def train(args):
             print(f"\tcurrent lr: {current_lr:.7f}")
             metrics = task.get_metrics(outputs)
             print("\t" + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
+
+            if use_vdl:
+                if "loss_scaling" in metrics:
+                    loss_scaling = metrics.pop("loss_scaling")
+                    expt.add_scalar("optimize/loss_scaling", loss_scaling, step)
+                expt.add_scalar("optimize/lr", current_lr, step)
+                for name, value in metrics.items():
+                    expt.add_scalar(f"train/{name}", value, step)
+
             timer.reset()
 
         if step % args.validation_steps == 0:
@@ -263,6 +284,11 @@ def evaluate(task,
 
     metrics = task.get_metrics(outputs)
     print(f"[Evaluation][{training_step}] " + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
+
+    if use_vdl:
+        for name, value in metrics.items():
+            expt.add_scalar(f"{tag}/{name}", value, training_step)
+
     print(f"\ttime cost: {timer.pass_time:.3f}")
     print("=" * 80)
     return metrics
@@ -278,10 +304,22 @@ def save_model(model, save_path, tag, dev_count, gpu_id, args):
         print(f"Saving model into {path}.")
         model.save(path, is_checkpoint=args.save_checkpoint)
         print(f"Model has saved into {path}.")
+
+        # tar saved model
+        run_cmd(f"cd {save_path} && tar --remove-files -cf {tag}.tar {tag}")
+        print("Tar saved model (DONE)")
     return
 
 
 if __name__ == "__main__":
-    args = setup_args()
-    check_cuda(True)
-    train(args)
+    try:
+        args = setup_args()
+        check_cuda(True)
+        train(args)
+    except:
+        if use_vdl:
+            expt.fail()
+        raise
+    else:
+        if use_vdl:
+            expt.success()

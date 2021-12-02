@@ -58,15 +58,15 @@ class RecFormer(Model):
         self.d_key = args.get("key_size", self.hidden_size // self.n_head)
         self.d_value = args.get("value_size", self.hidden_size // self.n_head)
         self.inner_hidden_size = args.get("inner_hidden_size", self.hidden_size * 4)
-        self.segment_len = args.get("segment_length", 128)
+        self.memory_length = args.get("memory_length", 256)
+        self.recursion_length = args.get("recursion_length", 128)
 
         # embeddings
         self.vocab_size = args.vocab_size
         self.type_size = args.type_vocab_size
-        self.pos_size = args.max_position_embeddings
         self.token_embedding = nn.Embedding(self.vocab_size, self.emb_size, weight_attr=param_attr)
         self.type_embedding = nn.Embedding(self.type_size, self.emb_size, weight_attr=param_attr)
-        self.pos_embedding = nn.Embedding(self.pos_size, self.emb_size, weight_attr=param_attr)
+        self.pos_embedding = nn.Embedding(self.recursion_length, self.emb_size, weight_attr=param_attr)
 
         # role embeddings
         self.use_role = args.use_role
@@ -119,7 +119,6 @@ class RecFormer(Model):
     def _gen_input(self,
                    token_ids,
                    type_ids,
-                   pos_ids,
                    role_ids,
                    aux_emb=None):
         """Generate input embeddings of Transformer
@@ -127,12 +126,14 @@ class RecFormer(Model):
         Args:
             tokens_ids: represents the token id of each token, shape is [batch_size, max_seq_len, 1]
             type_ids: represents the type of each token, shape is [batch_size, max_seq_len, 1]
-            pos_ids: represents the position of each token, shape is [batch_size, max_seq_len, 1]
             aux_emb: represents the auxiliary input embeddings of Transformer.
 
         Returns:
             A Tuple contains the input embeddings and the attention masking matrix of Transformer.
         """
+        segment_length = token_ids.shape[1]
+        pos_ids = paddle.to_tensor([i % self.recursion_length for i in range(segment_length)])
+
         token_emb_out = self.token_embedding(token_ids)
         type_emb_out = self.type_embedding(type_ids)
         pos_emb_out = self.pos_embedding(pos_ids)
@@ -154,7 +155,6 @@ class RecFormer(Model):
     def _generation_network(self,
                             token_ids,
                             type_ids,
-                            pos_ids,
                             role_ids,
                             aux_emb=None):
         """Run Transformer generation network.
@@ -162,14 +162,13 @@ class RecFormer(Model):
         Args:
             tokens_ids: represents the token id of each token, shape is [batch_size, max_seq_len, 1]
             type_ids: represents the type of each token, shape is [batch_size, max_seq_len, 1]
-            pos_ids: represents the position of each token, shape is [batch_size, max_seq_len, 1]
             aux_emb: represents the auxiliary input embeddings of Transformer.
 
         Returns:
             The output embeddings of Transformer.
         """
         emb_input = self._gen_input(
-            token_ids, type_ids, pos_ids, role_ids, aux_emb=aux_emb)
+            token_ids, type_ids, role_ids, aux_emb=aux_emb)
         if self._generation_caches is None:
             enc_out =  self._encode(emb_input)
         else:
@@ -184,7 +183,6 @@ class RecFormer(Model):
         enc_out = self._generation_network(
             state["token_ids"],
             state["type_ids"],
-            state["pos_ids"],
             state.get("role_ids", None),
         )
         logits = self._calc_logits(enc_out)
@@ -203,21 +201,30 @@ class RecFormer(Model):
         Returns:
             The output embeddings of Transformer.
         """
-        batch_size = emb_input.shape[0]
-        seg_len = emb_input.shape[1]
-
-        mask = paddle.tensor.triu((paddle.ones(
-            (seg_len, seg_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
+        outputs = []
+        _start = 0
+        _stop = emb_input.shape[1]
 
         # Output size [Batch, SegLen, HiddenDim]
-        detached_memories = [memory.detach() for memory in self.memories]
-        if(caches is not None):
-            outputs, caches = self.decoder(emb_input, detached_memories, 
-                    tgt_mask=mask,cache=caches)
-        else:
-            outputs = self.decoder(emb_input, detached_memories, tgt_mask=mask)
+        while _start < _stop:
+            rec_len = min(_stop - _start, self.recursion_length)
+            _end = _start + rec_len
+            mask = paddle.tensor.triu((paddle.ones(
+                (rec_len, rec_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
 
-        self.memories = self.encoder(emb_input, detached_memories)
+            if(caches is not None):
+                output, caches = self.decoder(emb_input[:, _start:_end, :], self.memories, 
+                        tgt_mask=mask, cache=caches)
+            else:
+                output = self.decoder(emb_input[:, _start:_end, :], self.memories, 
+                        tgt_mask=mask)
+            outputs.append(output)
+            self.memories = self.encoder(emb_input[:, _start:_end, :], self.memories)
+            _start = _end
+        self.memories = [memory.detach() for memory in self.memories]
+
+        # Re-concatenate all the results
+        outputs = paddle.concat(outputs, axis=1)
 
         return outputs if caches is None else (output, caches)
 
@@ -263,7 +270,6 @@ class RecFormer(Model):
         outputs["enc_out"] = self._generation_network(
             token_ids=inputs["token_ids"],
             type_ids=inputs["type_ids"],
-            pos_ids=inputs["pos_ids"],
             role_ids=inputs.get("role_ids", None),
         )
         return outputs
@@ -273,12 +279,13 @@ class RecFormer(Model):
         metrics = {}
 
         if "tgt_idx" in inputs:
-            tgt_logits = self._calc_logits(outputs["enc_out"], inputs["tgt_idx"])
-            mean_tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"])
+            raise Exception("Target Idx can not be used for recformer")
         else:
             tgt_logits = self._calc_logits(outputs["enc_out"])
             tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"], reduction="none")
-            mean_tgt_lm_loss = paddle.sum(tgt_lm_loss * inputs["loss_mask"]) / (paddle.sum(inputs["loss_mask"]) + 1e-8)
+            metrics["sum_lm_loss"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
+            metrics["sum_lm_mask"] = paddle.sum(inputs["loss_mask"])
+            mean_tgt_lm_loss = metrics["sum_lm_loss"] / (metrics["sum_lm_mask"] + 1e-8)
         metrics["token_lm_loss"] = mean_tgt_lm_loss
 
         loss = mean_tgt_lm_loss
@@ -325,5 +332,5 @@ class RecFormer(Model):
         else:
             raise NotImplementedError
 
-    def reset_memories(self, batch_size, segment_size=128):
-        self.memories = [paddle.full(shape=[batch_size, segment_size, self.hidden_size], fill_value=0.0)] * self.n_layer
+    def reset_memories(self, batch_size):
+        self.memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * self.n_layer
