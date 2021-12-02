@@ -326,7 +326,6 @@ class Model(nn.Layer, metaclass=ModelMeta):
         Returns:
             metrics: A dict mapping keys to corresponding metrics.
         """
-        self.train()
         with paddle.amp.auto_cast(
                 self.use_amp,
                 custom_white_list=["layer_norm", "softmax", "gelu"],
@@ -336,7 +335,6 @@ class Model(nn.Layer, metaclass=ModelMeta):
             metrics = self.get_metrics(inputs, outputs)
             return self._get_outputs(metrics)
 
-    @paddle.no_grad()
     def eval_step(self, inputs):
         """Run one evaluation step.
 
@@ -346,7 +344,6 @@ class Model(nn.Layer, metaclass=ModelMeta):
         Returns:
             metrics: A dict mapping keys to corresponding metrics.
         """
-        self.eval()
         inputs = self._get_inputs(inputs)
         outputs = self.forward(inputs)
         metrics = self.get_metrics(inputs, outputs)
@@ -354,7 +351,6 @@ class Model(nn.Layer, metaclass=ModelMeta):
         metrics.update(statistics)
         return self._get_outputs(metrics)
 
-    @paddle.no_grad()
     def infer_step(self, inputs):
         """Run one inference step.
 
@@ -364,7 +360,6 @@ class Model(nn.Layer, metaclass=ModelMeta):
         Returns:
             predictions: A dict mapping keys to corresponding predictions.
         """
-        self.eval()
         inputs = self._get_inputs(inputs, is_infer=True)
         outputs = self.forward(inputs, is_infer=True)
         predictions = self.infer(inputs, outputs)
@@ -430,8 +425,10 @@ class ModelInterface(object):
             metrics: A dict mapping keys to corresponding metrics.
         """
         if self.is_distributed:
+            self.dp_model.train()
             metrics = self.dp_model(inputs, mode="train")
         else:
+            self.model.train()
             metrics = self.model(inputs, mode="train")
         self.model.optimize(metrics)
         return self._get_outputs(metrics)
@@ -445,11 +442,16 @@ class ModelInterface(object):
         Returns:
             metrics: A dict mapping keys to corresponding metrics (numpy arrays).
         """
-        if self.is_distributed:
-            metrics = self.dp_model(inputs, mode="eval")
-        else:
-            metrics = self.model(inputs, mode="eval")
-        return self._get_outputs(metrics)
+        with paddle.no_grad():
+            if self.is_distributed:
+                # self.dp_model.eval()
+                # metrics = self.dp_model(inputs, mode="eval")
+                self.model.eval()
+                metrics = self.model(inputs, mode="eval")
+            else:
+                self.model.eval()
+                metrics = self.model(inputs, mode="eval")
+            return self._get_outputs(metrics)
 
     def infer_step(self, inputs):
         """Run one inference step.
@@ -460,11 +462,14 @@ class ModelInterface(object):
         Returns:
             predictions: A dict mapping keys to corresponding predictions (numpy arrays).
         """
-        if self.is_distributed:
-            predictions = self.dp_model(inputs, mode="infer")
-        else:
-            predictions = self.model(inputs, mode="infer")
-        return self._get_outputs(predictions)
+        with paddle.no_grad():
+            if self.is_distributed:
+                self.dp_model.eval()
+                predictions = self.dp_model(inputs, mode="infer")
+            else:
+                self.model.eval()
+                predictions = self.model(inputs, mode="infer")
+            return self._get_outputs(predictions)
 
     def get_data_loader(self, generator=None, is_infer=False):
         """Get the DataLoader of the model.

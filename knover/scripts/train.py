@@ -175,7 +175,8 @@ def train(args):
 
             timer.reset()
 
-        if step % args.validation_steps == 0:
+        if(("ready_for_validation" in outputs and outputs["ready_for_validation"]) or 
+            ("ready_for_validation" not in outputs) and (step % args.validation_steps == 0)):
             for valid_tag, valid_generator in zip(valid_tags, valid_generators):
                 eval_metrics = evaluate(task, model, valid_generator, args, dev_count, gpu_id, step, tag=valid_tag)
                 if valid_tag == "valid":

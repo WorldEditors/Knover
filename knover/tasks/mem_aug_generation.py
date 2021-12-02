@@ -34,6 +34,8 @@ class MemAugGeneration(DialogGeneration):
         super(MemAugGeneration, self).__init__(args)
         self.reader = LongTextReader(args)
         self.memories = None
+        self.validation_step = args.validation_step
+        self.step = 0
         if(self.reader.use_role):
             self.train_keys = ["token_ids", "type_ids", "role_ids", "tgt_label", "loss_mask"]
         else:
@@ -47,6 +49,8 @@ class MemAugGeneration(DialogGeneration):
         group = parser.add_argument_group("Task")
         group.add_argument("--segment_length", type=int, default=256,
                 help="length of each segments")
+        group.add_argument("--validation_step", type=int, default=1000,
+                help="use inner validation steps")
         DialogGeneration.add_cmdline_args(parser)
 
     def train_step(self, model: ModelInterface, inputs):
@@ -54,7 +58,7 @@ class MemAugGeneration(DialogGeneration):
         inputs = dict(zip(model.model.feed_names, inputs))
         
         model.model.reset_memories(inputs["batch_size"])
-        fin_outputs = {"token_lm_loss": 0.0}
+        fin_outputs = {"token_lm_loss": 0.0, "ready_for_validation": False}
         seg_num = inputs["seg_num"]
         sum_lm_mask = 0.0
 
@@ -63,9 +67,14 @@ class MemAugGeneration(DialogGeneration):
             seg_len = inputs["segment_lengths"][i]
             seg_input = {k:inputs[k][i, :seg_len] for k in self.train_keys}
             outputs = model.train_step(seg_input)
+            self.step += 1
 
             fin_outputs["token_lm_loss"] += outputs["sum_lm_loss"]
             sum_lm_mask += outputs["sum_lm_mask"]
+            if(self.step >= self.validation_step):
+                self.step = 0
+                fin_outputs["ready_for_validation"] = True
+                break
         fin_outputs["token_lm_loss"] /= sum_lm_mask
         fin_outputs["scheduled_lr"] = outputs["scheduled_lr"]
         fin_outputs["loss"] = fin_outputs["token_lm_loss"]
@@ -78,22 +87,26 @@ class MemAugGeneration(DialogGeneration):
         """Run one evaluation step"""
         inputs = dict(zip(model.model.feed_names, inputs))
 
-        model.model.reset_memories(batch_size, self.segment_length)
-        fin_outputs = {"token_lm_loss": 0.0, "loss": 0.0}
+        model.model.reset_memories(inputs["batch_size"])
+        fin_outputs = {"token_lm_loss": 0.0}
         seg_num = inputs["seg_num"]
-        all_token_num = int(paddle.sum(inputs["seggment_lengths"]))
+        sum_lm_mask = 0.0
 
         for i in range(inputs["seg_num"]):
             #avoiding large memories, do some detach
             seg_len = inputs["segment_lengths"][i]
             seg_input = {k:inputs[k][i, :seg_len] for k in self.train_keys}
-            outputs = model.train_step(seg_inputs)
+            outputs = model.eval_step(seg_input)
 
-            fin_outputs["token_lm_loss"] += seg_len / all_token_num * outputs["token_lm_loss"]
-            fin_outputs["loss"] += seg_len / all_token_num * outputs["loss"]
+            fin_outputs["token_lm_loss"] += outputs["sum_lm_loss"]
+            sum_lm_mask += outputs["sum_lm_mask"]
+        outputs["token_lm_loss"] = fin_outputs["token_lm_loss"] / sum_lm_mask
+        outputs["loss"] = outputs["token_lm_loss"]
+        del outputs["sum_lm_loss"]
+        del outputs["sum_lm_mask"]
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
-                   for k, v in fin_outputs.items()}
+                   for k, v in outputs.items()}
         return outputs
 
     def infer_step(self, model: ModelInterface, inputs):
