@@ -65,7 +65,7 @@ class MemAugGeneration(DialogGeneration):
         for i in range(inputs["seg_num"]):
             #avoiding large memories, do some detach
             seg_len = inputs["segment_lengths"][i]
-            seg_input = {k:inputs[k][i, :seg_len] for k in self.train_keys}
+            seg_input = {k:inputs[k][i, :, :seg_len] for k in self.train_keys}
             outputs = model.train_step(seg_input)
             self.step += 1
 
@@ -95,7 +95,7 @@ class MemAugGeneration(DialogGeneration):
         for i in range(inputs["seg_num"]):
             #avoiding large memories, do some detach
             seg_len = inputs["segment_lengths"][i]
-            seg_input = {k:inputs[k][i, :seg_len] for k in self.train_keys}
+            seg_input = {k:inputs[k][i, :, :seg_len] for k in self.train_keys}
             outputs = model.eval_step(seg_input)
 
             fin_outputs["token_lm_loss"] += outputs["sum_lm_loss"]
