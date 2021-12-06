@@ -60,12 +60,17 @@ class RecFormer(Model):
         self.inner_hidden_size = args.get("inner_hidden_size", self.hidden_size * 4)
         self.memory_length = args.get("memory_length", 256)
         self.recursion_length = args.get("recursion_length", 128)
+        self.aux_loss_weight = args.get("auxiliary_loss_weight", 0.50)
 
         # embeddings
         self.vocab_size = args.vocab_size
         self.type_size = args.type_vocab_size
+        if(self.type_size < 1):
+            self.type_embedding = None
+        else:
+            self.type_embedding = nn.Embedding(self.type_size, self.emb_size, weight_attr=param_attr)
+
         self.token_embedding = nn.Embedding(self.vocab_size, self.emb_size, weight_attr=param_attr)
-        self.type_embedding = nn.Embedding(self.type_size, self.emb_size, weight_attr=param_attr)
         self.pos_embedding = nn.Embedding(self.recursion_length, self.emb_size, weight_attr=param_attr)
 
         # role embeddings
@@ -92,12 +97,16 @@ class RecFormer(Model):
         self.decoder_layer = TransformerDecoderLayer(
             self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
+        self.aux_decoder_layer = TransformerDecoderLayer(
+            self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
+            act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
 
         if self.normalize_before:
             output_norm = nn.LayerNorm(self.hidden_size)
         else:
             output_norm = None
         self.decoder = RecFormerDecoder(self.decoder_layer, self.n_layer, output_norm)
+        self.aux_decoder = RecFormerDecoder(self.aux_decoder_layer, self.n_layer, output_norm)
 
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
@@ -135,9 +144,12 @@ class RecFormer(Model):
         pos_ids = paddle.to_tensor([i % self.recursion_length for i in range(segment_length)])
 
         token_emb_out = self.token_embedding(token_ids)
-        type_emb_out = self.type_embedding(type_ids)
         pos_emb_out = self.pos_embedding(pos_ids)
-        emb_out = token_emb_out + type_emb_out + pos_emb_out
+        emb_out = token_emb_out + pos_emb_out
+
+        if(self.type_embedding is not None):
+            type_emb_out = self.type_embedding(type_ids)
+            emb_out = emb_out + type_emb_out
 
         if self.use_role:
             role_emb_out = self.role_embedding(role_ids)
@@ -169,12 +181,13 @@ class RecFormer(Model):
         """
         emb_input = self._gen_input(
             token_ids, type_ids, role_ids, aux_emb=aux_emb)
+        aux_out = None
         if self._generation_caches is None:
-            enc_out =  self._encode(emb_input)
+            enc_out, aux_out =  self._encode(emb_input)
         else:
             enc_out, self._generation_caches = self._encode(
                 emb_input, self._generation_caches)
-        return enc_out
+        return enc_out, aux_out
 
     def _generation_step(self, state):
         # gather caches
@@ -221,12 +234,21 @@ class RecFormer(Model):
             outputs.append(output)
             self.memories = self.encoder(emb_input[:, _start:_end, :], self.memories)
             _start = _end
+        outputs = paddle.concat(outputs, axis=1)
+
+        # Auxiliary Decoder
+        if(caches is None):
+            mask = paddle.tensor.triu((paddle.ones(
+                (_stop, _stop), dtype=paddle.get_default_dtype()) * -np.inf), 1)
+
+            aux_outputs = self.aux_decoder(emb_input, self.memories, 
+                    tgt_mask=mask)
+
         self.memories = [memory.detach() for memory in self.memories]
 
         # Re-concatenate all the results
-        outputs = paddle.concat(outputs, axis=1)
 
-        return outputs if caches is None else (output, caches)
+        return (outputs, aux_outputs) if caches is None else (output, caches)
 
     def _calc_logits(self, enc_out, tgt_idx=None):
         """Get the logits of generation task.
@@ -267,7 +289,7 @@ class RecFormer(Model):
         else:
             self._generation_caches = None
 
-        outputs["enc_out"] = self._generation_network(
+        outputs["enc_out"], outputs["aux_out"] = self._generation_network(
             token_ids=inputs["token_ids"],
             type_ids=inputs["type_ids"],
             role_ids=inputs.get("role_ids", None),
@@ -282,13 +304,18 @@ class RecFormer(Model):
             raise Exception("Target Idx can not be used for recformer")
         else:
             tgt_logits = self._calc_logits(outputs["enc_out"])
+            aux_tgt_logits = self._calc_logits(outputs["aux_out"])
             tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"], reduction="none")
+            aux_lm_loss = F.cross_entropy(aux_tgt_logits, inputs["tgt_label"], reduction="none")
             metrics["sum_lm_loss"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
+            metrics["sum_aux_loss"] = paddle.sum(aux_lm_loss * inputs["loss_mask"])
             metrics["sum_lm_mask"] = paddle.sum(inputs["loss_mask"])
             mean_tgt_lm_loss = metrics["sum_lm_loss"] / (metrics["sum_lm_mask"] + 1e-8)
+            mean_aux_lm_loss = metrics["sum_aux_loss"] / (metrics["sum_lm_mask"] + 1e-8)
         metrics["token_lm_loss"] = mean_tgt_lm_loss
+        metrics["token_aux_loss"] = mean_aux_lm_loss
 
-        loss = mean_tgt_lm_loss
+        loss = mean_tgt_lm_loss + self.aux_loss_weight * mean_aux_lm_loss
         metrics["loss"] = loss
         return metrics
 

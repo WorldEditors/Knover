@@ -9,11 +9,12 @@
   "hidden_dropout_prob": 0.1,
   "hidden_size": 512,
   "memory_length": 256,
-  "recursion_length": 256,
+  "recursion_length": 128,
   "initializer_range": 0.02,
   "num_attention_heads": 8,
-  "num_hidden_layers": 12,
-  "type_vocab_size": 2,
-  "role_type_size": 32,
+  "num_hidden_layers": 8,
+  "type_vocab_size": 0,
+  "role_type_size": 0,
+  "auxiliary_loss_weight": 0.20,
   "vocab_size": 267739
 }

@@ -58,7 +58,7 @@ class MemAugGeneration(DialogGeneration):
         inputs = dict(zip(model.model.feed_names, inputs))
         
         model.model.reset_memories(inputs["batch_size"])
-        fin_outputs = {"token_lm_loss": 0.0, "ready_for_validation": False}
+        fin_outputs = {"token_lm_loss": 0.0, "token_aux_loss": 0.0, "loss": 0.0, "ready_for_validation": False}
         seg_num = inputs["seg_num"]
         sum_lm_mask = 0.0
 
@@ -70,14 +70,17 @@ class MemAugGeneration(DialogGeneration):
             self.step += 1
 
             fin_outputs["token_lm_loss"] += outputs["sum_lm_loss"]
+            fin_outputs["token_aux_loss"] += outputs["sum_aux_loss"]
+            fin_outputs["loss"] += outputs["loss"] * outputs["sum_lm_mask"]
             sum_lm_mask += outputs["sum_lm_mask"]
             if(self.step >= self.validation_step):
                 self.step = 0
                 fin_outputs["ready_for_validation"] = True
                 break
         fin_outputs["token_lm_loss"] /= sum_lm_mask
+        fin_outputs["token_aux_loss"] /= sum_lm_mask
+        fin_outputs["loss"] /= sum_lm_mask
         fin_outputs["scheduled_lr"] = outputs["scheduled_lr"]
-        fin_outputs["loss"] = fin_outputs["token_lm_loss"]
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
                    for k, v in fin_outputs.items()}
@@ -88,7 +91,7 @@ class MemAugGeneration(DialogGeneration):
         inputs = dict(zip(model.model.feed_names, inputs))
 
         model.model.reset_memories(inputs["batch_size"])
-        fin_outputs = {"token_lm_loss": 0.0}
+        fin_outputs = {"token_lm_loss": 0.0, "token_aux_loss": 0.0, "loss": 0.0}
         seg_num = inputs["seg_num"]
         sum_lm_mask = 0.0
 
@@ -99,9 +102,14 @@ class MemAugGeneration(DialogGeneration):
             outputs = model.eval_step(seg_input)
 
             fin_outputs["token_lm_loss"] += outputs["sum_lm_loss"]
+            fin_outputs["token_aux_loss"] += outputs["sum_aux_loss"]
+            fin_outputs["loss"] += outputs["loss"] * outputs["sum_lm_mask"]
             sum_lm_mask += outputs["sum_lm_mask"]
+
         outputs["token_lm_loss"] = fin_outputs["token_lm_loss"] / sum_lm_mask
-        outputs["loss"] = outputs["token_lm_loss"]
+        outputs["token_aux_loss"] = fin_outputs["token_aux_loss"] / sum_lm_mask
+        outputs["loss"] = fin_outputs["loss"] / sum_lm_mask
+
         del outputs["sum_lm_loss"]
         del outputs["sum_lm_mask"]
 
