@@ -101,12 +101,8 @@ class RecFormer(Model):
             self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
 
-        if self.normalize_before:
-            output_norm = nn.LayerNorm(self.hidden_size)
-        else:
-            output_norm = None
-        self.decoder = RecFormerDecoder(self.decoder_layer, self.n_layer, output_norm)
-        self.aux_decoder = RecFormerDecoder(self.aux_decoder_layer, self.n_layer, output_norm)
+        self.decoder = RecFormerDecoder(self.decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
+        self.aux_decoder = RecFormerDecoder(self.aux_decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
 
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)

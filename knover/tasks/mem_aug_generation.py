@@ -47,7 +47,7 @@ class MemAugGeneration(DialogGeneration):
     def add_cmdline_args(cls, parser):
         """Add cmdline arguments."""
         group = parser.add_argument_group("Task")
-        group.add_argument("--segment_length", type=int, default=256,
+        group.add_argument("--segment_length", nargs='+', type=int, default=256,
                 help="length of each segments")
         group.add_argument("--validation_step", type=int, default=1000,
                 help="use inner validation steps")
@@ -61,6 +61,7 @@ class MemAugGeneration(DialogGeneration):
         fin_outputs = {"token_lm_loss": 0.0, "token_aux_loss": 0.0, "loss": 0.0, "ready_for_validation": False}
         seg_num = inputs["seg_num"]
         sum_lm_mask = 0.0
+        #print("batch and segments:", inputs["batch_size"], inputs["segment_lengths"][0])
 
         for i in range(inputs["seg_num"]):
             #avoiding large memories, do some detach
@@ -77,6 +78,8 @@ class MemAugGeneration(DialogGeneration):
                 self.step = 0
                 fin_outputs["ready_for_validation"] = True
                 break
+            #print("training loss", outputs["token_lm_loss"],  outputs["token_aux_loss"])
+
         fin_outputs["token_lm_loss"] /= sum_lm_mask
         fin_outputs["token_aux_loss"] /= sum_lm_mask
         fin_outputs["loss"] /= sum_lm_mask
@@ -105,16 +108,16 @@ class MemAugGeneration(DialogGeneration):
             fin_outputs["token_aux_loss"] += outputs["sum_aux_loss"]
             fin_outputs["loss"] += outputs["loss"] * outputs["sum_lm_mask"]
             sum_lm_mask += outputs["sum_lm_mask"]
+            #print("eval loss", outputs["token_lm_loss"],  outputs["token_aux_loss"])
 
-        outputs["token_lm_loss"] = fin_outputs["token_lm_loss"] / sum_lm_mask
-        outputs["token_aux_loss"] = fin_outputs["token_aux_loss"] / sum_lm_mask
-        outputs["loss"] = fin_outputs["loss"] / sum_lm_mask
-
-        del outputs["sum_lm_loss"]
-        del outputs["sum_lm_mask"]
+        fin_outputs["token_lm_loss"] /= sum_lm_mask
+        fin_outputs["token_aux_loss"] /= sum_lm_mask
+        fin_outputs["loss"] /= sum_lm_mask
+        fin_outputs["batch_size"] = outputs["batch_size"]
+        fin_outputs["tokens_num"] = outputs["tokens_num"]
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
-                   for k, v in outputs.items()}
+                   for k, v in fin_outputs.items()}
         return outputs
 
     def infer_step(self, model: ModelInterface, inputs):

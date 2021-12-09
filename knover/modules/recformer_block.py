@@ -97,7 +97,7 @@ class RecFormerEncoderLayer(Layer):
         """
         l_m = memory.shape[1]
         l_s = src.shape[1]
-        concat_src = paddle.concat(x=[memory, src], axis=1)
+        concat_src = paddle.concat(x=[src, memory], axis=1)
         if self.normalize_before:
             concat_src = self.norm1(concat_src)
 
@@ -123,7 +123,8 @@ class RecFormerEncoderLayer(Layer):
         if not self.normalize_before:
             output = self.norm2(output)
         #return M_{t+1}^{L}, X_{t}^{L+1} if L is not last layer else M_{t+1}^{L} only
-        return paddle.split(output, [l_m, l_s], axis=1) if (not is_last_layer) else output
+
+        return paddle.split(output, [l_s, l_m], axis=1) if(not is_last_layer) else output
 
 class RecFormerEncoder(Layer):
     """
@@ -151,22 +152,25 @@ class RecFormerEncoder(Layer):
         new_memories = []
         output = src
         for i, mod in enumerate(self.layers[:-1]):
-            out_memory, output = mod(output, memories[i])
-            new_memories.append(out_memory)
-        out_memory = self.layers[-1](output, memories[self.num_layers-1], is_last_layer=True)
-        new_memories.append(out_memory)
+            output, mem = mod(output, memories[i])
+            new_memories.append(mem)
+        mem = self.layers[-1](output, memories[self.num_layers-1], is_last_layer=True)
+        new_memories.append(mem)
 
         return new_memories
 
 class RecFormerDecoder(Layer):
 
-    def __init__(self, decoder_layer, num_layers, norm=None):
+    def __init__(self, decoder_layer, d_model, num_layers, normalize_before=False):
         super(RecFormerDecoder, self).__init__()
         self.layers = LayerList([(decoder_layer if i == 0 else
                                   type(decoder_layer)(**decoder_layer._config))
                                  for i in range(num_layers)])
         self.num_layers = num_layers
-        self.norm = norm
+        self.normalize_before = normalize_before
+        if(self.normalize_before):
+            self.norm1 = [LayerNorm(d_model) for i in range(num_layers)]
+            self.norm2 = LayerNorm(d_model) 
 
     def forward(self, tgt, memories, tgt_mask=None, caches=None):
         """
@@ -178,19 +182,20 @@ class RecFormerDecoder(Layer):
         output = tgt
         new_caches = []
         for i, mod in enumerate(self.layers):
+            mem = self.norm1[i](memories[i]) if self.normalize_before else memories[i]
             if caches is None:
                 output = mod(output,
-                        memories[i],
+                        mem,
                         tgt_mask=tgt_mask,
                         cache=None)
             else:
                 output, new_cache = mod(output,
-                        memories[i],
+                        mem,
                         tgt_mask=tgt_mask,
                         cache=caches["cache"][i])
                 new_caches.append(new_cache)
-        if self.norm is not None:
-            output = self.norm(output)
+        if self.norm2 is not None:
+            output = self.norm2(output)
 
         return output if caches is None else (output, new_caches)
 

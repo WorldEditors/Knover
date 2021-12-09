@@ -140,6 +140,7 @@ class DialogReader(object):
             self.features = {}
         return
 
+
     def get_train_progress(self):
         """Gets progress for training phase."""
         return self.current_epoch, self.current_file_index, self.total_file
@@ -205,6 +206,9 @@ class DialogReader(object):
             assert len(field_values[k]) == len(field_values["token_ids"]), \
                 f"len(field_values[{k}]) != len(field_values['token_ids'])"
         return field_values
+
+    def _adjust_batch(self):
+        pass
 
     def _parse_knowledge(self, knowledge):
         """Parse knowledge sequence and return corresponding fields."""
@@ -424,6 +428,7 @@ class DialogReader(object):
                     continue
 
                 self.current_example += 1
+                self._adjust_batch()
                 max_lens = self._update_max_lens(max_lens, record)
                 if self.in_tokens:
                     to_append = (len(batch) + 1) * sum(max_lens) <= self.batch_size
@@ -449,6 +454,7 @@ class DialogReader(object):
             for record in pool:
                 self.current_example += 1
                 max_lens = self._update_max_lens(max_lens, record)
+                self._adjust_batch()
                 if self.in_tokens:
                     to_append = (len(batch) + 1) * sum(max_lens) <= self.batch_size
                 else:
