@@ -37,6 +37,8 @@ fleetrun \
     --config_path ${config_path} \
     ${train_args:-} \
     --in_tokens ${in_tokens:-"true"} \
+    --use_vdl ${use_vdl:-"true"} \
+    --on_k8s ${on_k8s:-"false"} \
     --batch_size ${batch_size:-8192} \
     --learning_rate ${lr} \
     --warmup_steps ${warmup_steps:-0} \
@@ -47,6 +49,7 @@ fleetrun \
     --validation_steps ${validation_steps} \
     --save_steps ${save_steps} \
     --save_path ${save_path} \
+    --vdl_log_path ${vdl_log_path} \
     --random_seed ${random_seed:-11}
 exit_code=$?
 
