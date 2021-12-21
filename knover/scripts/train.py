@@ -20,7 +20,6 @@ import os
 import subprocess
 import time
 
-#import expt
 import paddle
 import numpy as np
 import paddle.fluid as fluid
@@ -30,13 +29,16 @@ import knover.models as models
 import knover.tasks as tasks
 from knover.utils import check_cuda, parse_args, str2bool, Timer
 
-use_vdl = False
+writer=None
+use_vdl=False
 
 def setup_args():
     """Setup training arguments."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--use_k8s", type=str2bool, default=False,
-                        help="Whether to run on k8s cluster.")
+    parser.add_argument("--use_vdl", type=str2bool, default=False,
+                        help="Whether to run on vdl.")
+    parser.add_argument("--on_k8s", type=str2bool, default=False,
+                        help="Whether it is running on k8s.")
     parser.add_argument("--is_distributed", type=str2bool, default=False,
                         help="Whether to run distributed training.")
     parser.add_argument("--save_path", type=str, default="output",
@@ -48,6 +50,8 @@ def setup_args():
                         help="The validation datasets: files / filelists. "
                         "The files / filelists are separated by `,`. "
                         "See more details in `docs/usage.md`: `file_format`.")
+    parser.add_argument("--vdl_log_path", type=str, default="vdl_logs",
+                        help="The path where to put vdl_logs.")
 
     parser.add_argument("--start_step", type=int, default=0,
                         help="The start step of training. It will be updated if you load from a checkpoint.")
@@ -129,11 +133,18 @@ def train(args):
         ))
 
     # setup VDL and expt
-    global use_vdl
-    use_vdl = args.use_k8s and trainer_id == 0
+    global use_vdl, writer
+    use_vdl = args.use_vdl and trainer_id == 0
     if use_vdl:
-        expt.init(name=os.getenv("EXPT_NAME", "DEBUG"))
-        expt.set_params(args.Model)
+        if args.is_k8s:
+            import expt
+            expt.init(name=os.getenv("EXPT_NAME", "DEBUG"))
+            expt.set_params(args.Model)
+            writer = expt
+        else:
+            from visualdl import LogWriter
+            writer = LogWriter(logdir=args.vdl_log_path)
+            print("vdl_logs", args.vdl_log_path)
 
     # maintain best metric (init)
     best_metric = -1e10
@@ -168,10 +179,10 @@ def train(args):
             if use_vdl:
                 if "loss_scaling" in metrics:
                     loss_scaling = metrics.pop("loss_scaling")
-                    expt.add_scalar("optimize/loss_scaling", loss_scaling, step)
-                expt.add_scalar("optimize/lr", current_lr, step)
+                    writer.add_scalar("optimize/loss_scaling", loss_scaling, step)
+                writer.add_scalar("optimize/lr", current_lr, step)
                 for name, value in metrics.items():
-                    expt.add_scalar(f"train/{name}", value, step)
+                    writer.add_scalar(f"train/{name}", value, step)
 
             timer.reset()
 
@@ -288,7 +299,7 @@ def evaluate(task,
 
     if use_vdl:
         for name, value in metrics.items():
-            expt.add_scalar(f"{tag}/{name}", value, training_step)
+            writer.add_scalar(f"{tag}/{name}", value, training_step)
 
     print(f"\ttime cost: {timer.pass_time:.3f}")
     print("=" * 80)
@@ -318,9 +329,9 @@ if __name__ == "__main__":
         check_cuda(True)
         train(args)
     except:
-        if use_vdl:
+        if use_vdl and args.on_k8s:
             expt.fail()
         raise
     else:
-        if use_vdl:
+        if use_vdl and args.on_k8s:
             expt.success()
