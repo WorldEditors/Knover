@@ -30,17 +30,17 @@ class LongTextReader(DialogReader):
     def __init__(self, args):
         super(LongTextReader, self).__init__(args)
         self.segment_length = args.segment_length
-        assert self.in_tokens==True, "Long Text Reader Only Supports Token Based Batches"
+        self.seg_batch_in_tokens = self.in_tokens
+        self.seg_batch_size = args.batch_size
+
         self.in_tokens = False
-        self.all_token_num = args.batch_size
-        self.dynamic_batch_choice = list()
+        self.dynamic_segment_choice = list()
 
         if(isinstance(self.segment_length, list)):
             for seg_len in self.segment_length:
-                self.dynamic_batch_choice.append(max(1, self.all_token_num // seg_len + 1))
+                self.dynamic_segment_choice.append(seg_len)
         else:
-            self.dynamic_batch_choice.append(max(1, self.all_token_num // self.segment_length + 1))
-
+            self.dynamic_segment_choice.append(self.segment_length)
         return
 
     @classmethod
@@ -52,7 +52,11 @@ class LongTextReader(DialogReader):
         DialogReader.add_cmdline_args(parser)
 
     def _adjust_batch(self):
-        self.batch_size = random.choice(self.dynamic_batch_choice)
+        self.segment_length = random.choice(self.dynamic_segment_choice)
+        if(self.seg_batch_in_tokens):
+            self.batch_size = self.seg_batch_size // self.segment_length
+        else:
+            self.batch_size = self.seg_batch_size
 
     def _pad_batch_records(self, batch_records, is_infer, phase=None):
         """Padding a batch of records and construct model's inputs.
@@ -63,14 +67,12 @@ class LongTextReader(DialogReader):
         assert self.is_autoregressive, "Currently, LongText Reader Only supports autoregressive mode"
         batch = super(LongTextReader, self)._pad_batch_records(batch_records, is_infer, phase)
         batch_size = len(batch_records)
-        cur_seg_len = self.all_token_num // batch_size 
         all_seq_len = batch["token_ids"].shape[1] - 1
 
-        seg_num = (all_seq_len - 1) // cur_seg_len + 1
-        seg_len_list = [cur_seg_len] * seg_num
-        seg_len_list[-1] -= cur_seg_len * seg_num - all_seq_len
-        res_seg = cur_seg_len - seg_len_list[-1]
-
+        seg_num = (all_seq_len - 1) // self.segment_length + 1
+        seg_len_list = [self.segment_length] * seg_num
+        seg_len_list[-1] -= self.segment_length * seg_num - all_seq_len
+        res_seg = self.segment_length - seg_len_list[-1]
 
         batch_token_ids = paddle.concat([paddle.to_tensor(batch["token_ids"][:, :-1]), paddle.full((batch_size, res_seg), self.pad_id, dtype='int64')], axis=1)
         batch_type_ids = paddle.concat([paddle.to_tensor(batch["type_ids"][:, :-1]), paddle.full((batch_size, res_seg), 0, dtype='int64')], axis=1)
@@ -89,7 +91,7 @@ class LongTextReader(DialogReader):
         # add pos id
         batch["batch_size"] = batch_size
         batch["seg_num"] = seg_num
-        batch["seg_len"] = cur_seg_len
+        batch["seg_len"] = self.segment_length
         batch["segment_lengths"] = seg_len_list
 
         return batch

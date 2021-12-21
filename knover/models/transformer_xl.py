@@ -98,7 +98,7 @@ class TransformerXL(Model):
             self.input_norm = None
             output_norm = nn.LayerNorm(self.hidden_size)
 
-        self.decoder = TransformerEncoder(encoder_layer, self.n_layer, output_norm)
+        self.encoder = TransformerEncoder(encoder_layer, self.n_layer, output_norm)
 
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
@@ -135,24 +135,11 @@ class TransformerXL(Model):
         batch_size = token_ids.shape[0]
         segment_length = token_ids.shape[1]
         pos_ids = paddle.to_tensor([[i % segment_length for i in range(segment_length)]] * batch_size)
-        #print("pos_ids", pos_ids.shape, token_ids.shape)
-
-        #def check_emb(info, emb, ids):
-        #    s_emb = paddle.abs(paddle.sum(emb, axis=[-1]))
-        #    if(paddle.sum(emb) > 1.0e+8):
-        #        i = paddle.argmax(s_emb)
-        #        #k = paddle.argmax(paddle.abs(emb[i[0],i[1]]))
-        #        print(info, i)
-        #        print("emb", s_emb[i[0],i[1]], emb[i[0],i[1]])
-        #        raise Exception("Error Occured")
+        pos_ids = paddle.clip(pos_ids, max=self.pos_size-1)
 
         token_emb_out = self.token_embedding(token_ids)
         pos_emb_out = self.pos_embedding(pos_ids)
         emb_out = token_emb_out + pos_emb_out
-        #print("token_emb", token_ids[:, 0], token_emb_out[0, :, 0], self.token_embedding.weight[:, 0])
-        #print("pos_emb", pos_ids[:, 0], pos_emb_out[0, :, 0], self.pos_embedding.weight[:, 0])
-        #check_emb("token_emb", token_emb_out, token_ids)
-        #check_emb("pos_emb", pos_emb_out, pos_ids)
 
         if(self.type_embedding is not None):
             type_emb_out = self.type_embedding(type_ids)
@@ -217,7 +204,7 @@ class TransformerXL(Model):
             emb_input: represents the input embeddings fo Transformer, shape is [batch_size, max_seq_len, hidden_dim]
             caches: Dict of {"seg_id": n_seg_id,
                 "memories": long_term_memories,
-                "kv": key_value_cache_for_decoder
+                "kv": key_value_cache_for_encoder
             }
 
         Returns:
@@ -232,9 +219,9 @@ class TransformerXL(Model):
             (_stop, _stop), dtype=paddle.get_default_dtype()) * -1.0e+9), 1)
 
         if(caches is not None):
-            output, caches = self.decoder(emb_input, mask, cache=caches)
+            output, caches = self.encoder(emb_input, mask, cache=caches)
         else:
-            output = self.decoder(emb_input, mask)
+            output = self.encoder(emb_input, mask)
 
         # Re-concatenate all the results
 
@@ -275,7 +262,7 @@ class TransformerXL(Model):
         """Run model main forward."""
         outputs = {}
         if is_infer:
-            self._generation_caches = self.decoder.gen_cache(self.memories)
+            self._generation_caches = self.encoder.gen_cache()
         else:
             self._generation_caches = None
         outputs["enc_out"] = self._generation_network(
@@ -303,7 +290,6 @@ class TransformerXL(Model):
 
         loss = mean_tgt_lm_loss
         metrics["loss"] = loss
-        #print("loss", metrics["loss"])
         return metrics
 
     def get_statistics(self, inputs, outputs):
@@ -319,32 +305,7 @@ class TransformerXL(Model):
 
         Only support generation now.
         """
-        if self.do_generation:
-            outputs = self.generator(self, inputs, outputs)
-            data_id_list = outputs["data_id"].numpy()
-            token_ids_list = outputs["token_ids"].numpy()
-            seq_ids_list = outputs["finished_ids"].numpy()
-            score_list = outputs["finished_score"].numpy()
-            predictions = []
-            for data_id, token_ids, seq_ids, score in zip(data_id_list, token_ids_list, seq_ids_list, score_list):
-                if len(seq_ids.shape) == 1:
-                    pred = {}
-                    pred["data_id"] = int(data_id)
-                    pred["decode_score"] = float(score)
-                    pred["context_token_ids"] = token_ids
-                    pred["response_token_ids"] = seq_ids
-                    predictions.append(pred)
-                else:
-                    for candidate_seq_ids, candidate_score in zip(seq_ids, score):
-                        pred = {}
-                        pred["data_id"] = int(data_id)
-                        pred["decode_score"] = float(candidate_score)
-                        pred["context_token_ids"] = token_ids
-                        pred["response_token_ids"] = candidate_seq_ids
-                        predictions.append(pred)
-            return predictions
-        else:
-            raise NotImplementedError
+        raise NotImplementedError
 
     def reset_memories(self, batch_size):
         pass
