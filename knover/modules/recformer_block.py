@@ -98,23 +98,27 @@ class RecFormerEncoderLayer(Layer):
         l_m = memory.shape[1]
         l_s = src.shape[1]
         concat_src = paddle.concat(x=[src, memory], axis=1)
-        if self.normalize_before:
-            concat_src = self.norm1(concat_src)
 
-        # Add cache for encoder for the usage like UniLM
         if(not is_last_layer):
-            output = self.self_attn(concat_src, concat_src, concat_src, None)
             residual = concat_src
         else:
-            output = self.self_attn(memory, concat_src, concat_src, None)
             residual = memory
 
-        output = residual + self.dropout1(output)
+        if self.normalize_before:
+            concat_src = self.norm1(src)
+            normalized_mem = self.norm1(memory)
 
+        if(not is_last_layer):
+            output = self.self_attn(concat_src, concat_src, concat_src, None)
+        else:
+            output = self.self_attn(normalized_mem, concat_src, concat_src, None)
+
+        output = residual + self.dropout1(output)
         if not self.normalize_before:
             output = self.norm1(output)
 
         residual = output
+
         if self.normalize_before:
             output = self.norm2(output)
 
@@ -122,7 +126,6 @@ class RecFormerEncoderLayer(Layer):
         output = residual + self.dropout2(output)
         if not self.normalize_before:
             output = self.norm2(output)
-        #return M_{t+1}^{L}, X_{t}^{L+1} if L is not last layer else M_{t+1}^{L} only
 
         return paddle.split(output, [l_s, l_m], axis=1) if(not is_last_layer) else output
 
@@ -159,10 +162,114 @@ class RecFormerEncoder(Layer):
 
         return new_memories
 
-class RecFormerDecoder(Layer):
+class MemAugDecoderLayer(Layer):
+    """
+    RecFormer Encoder Layer
+    Takes the External Memory M_{t}^{L}, X_{t}^{L}, yield the External Memory in Next Step M_{t+1}^{L}, X_{t}^{L+1}
+    """
 
+    def __init__(self,
+                 d_model,
+                 nhead,
+                 dim_feedforward,
+                 dropout=0.1,
+                 activation="relu",
+                 attn_dropout=None,
+                 act_dropout=None,
+                 normalize_before=False,
+                 independent_attn=False,
+                 weight_attr=None,
+                 bias_attr=None):
+        self._config = locals()
+        self._config.pop("self")
+        self._config.pop("__class__", None)  # py3
+
+        super(MemAugDecoderLayer, self).__init__()
+
+        assert d_model > 0, ("Expected d_model to be greater than 0, "
+                             "but recieved {}".format(d_model))
+        assert nhead > 0, ("Expected nhead to be greater than 0, "
+                           "but recieved {}".format(nhead))
+        assert dim_feedforward > 0, (
+            "Expected dim_feedforward to be greater than 0, "
+            "but recieved {}".format(dim_feedforward))
+
+        attn_dropout = dropout if attn_dropout is None else attn_dropout
+        act_dropout = dropout if act_dropout is None else act_dropout
+        self.normalize_before = normalize_before
+
+        weight_attrs = _convert_param_attr_to_list(weight_attr, 2)
+        bias_attrs = _convert_param_attr_to_list(bias_attr, 2)
+
+        self.self_attn = MultiHeadAttention(
+            d_model,
+            nhead,
+            dropout=attn_dropout,
+            weight_attr=weight_attrs[0],
+            bias_attr=bias_attrs[0])
+
+        self.linear1 = Linear(
+            d_model, dim_feedforward, weight_attrs[1], bias_attr=bias_attrs[1])
+        self.dropout = Dropout(act_dropout, mode="upscale_in_train")
+        self.linear2 = Linear(
+            dim_feedforward, d_model, weight_attrs[1], bias_attr=bias_attrs[1])
+        self.norm1 = LayerNorm(d_model)
+        self.norm2 = LayerNorm(d_model)
+        self.dropout1 = Dropout(dropout, mode="upscale_in_train")
+        self.dropout2 = Dropout(dropout, mode="upscale_in_train")
+        self.activation = getattr(F, activation)
+
+    def forward(self, memory, tgt, tgt_mask=None, cache=None):
+        """
+        src: source to be encoded into the memory, should be tensor of size [Batch, SeqLen, Hidden]
+        memory: tensor of size [Batch, SegmentLen, Hidden]
+        is_last_layer: for the last layer we will not process the source token
+        """
+        l_s = tgt.shape[1]
+        residual = tgt
+
+        if(memory is None):
+            concat_src = tgt
+            l_m = 0
+        else:
+            concat_src = paddle.concat(x=[memory, tgt], axis=1)
+            l_m = memory.shape[1]
+
+        if self.normalize_before:
+            tgt = self.norm1(tgt)
+            concat_src = self.norm1(concat_src)
+
+        # Add cache for encoder for the usage like UniLM
+        if(cache is None):
+            output = self.self_attn(tgt, concat_src, concat_src, tgt_mask)
+        else:
+            output, new_cache = self.self_attn(tgt, concat_src, concat_src, tgt_mask, cache)
+        residual = tgt
+
+        output = residual + self.dropout1(output)
+        if not self.normalize_before:
+            output = self.norm1(output)
+
+        residual = output
+        if self.normalize_before:
+            output = self.norm2(output)
+
+        output = self.linear2(self.dropout(self.activation(self.linear1(output))))
+        output = residual + self.dropout2(output)
+        if not self.normalize_before:
+            output = self.norm2(output)
+        #return M_{t+1}^{L}, X_{t}^{L+1} if L is not last layer else M_{t+1}^{L} only
+
+        return output if cache is None else (output, new_cache)
+
+    def gen_cache(self, tgt):
+        incremental_cache = self.self_attn.gen_cache(
+                src, type=self.self_attn.Cache)
+        return increamental_cache
+
+class MemAugDecoder(Layer):
     def __init__(self, decoder_layer, d_model, num_layers, normalize_before=False):
-        super(RecFormerDecoder, self).__init__()
+        super(MemAugDecoder, self).__init__()
         self.layers = LayerList([(decoder_layer if i == 0 else
                                   type(decoder_layer)(**decoder_layer._config))
                                  for i in range(num_layers)])
@@ -177,34 +284,46 @@ class RecFormerDecoder(Layer):
         tgt:  A tensor of shape [Batch, Sequence, Hidden]
         memories:  A NumLayers list of tensor of shape [Batch, Sequence, Hidden]
         """
-        tgt_mask = _convert_attention_mask(tgt_mask, tgt.dtype)
+        seq_len = tgt.shape[1]
+        if(memories is None):
+            mem_len = 0
+        else:
+            mem_len = memories[0].shape[1]
+            if(tgt_mask is not None):
+                tgt_mask = paddle.concat([paddle.zeros((seq_len, mem_len)), tgt_mask], axis=1)
 
         output = tgt
         new_caches = []
+        new_memories = []
+        new_memories.append(output.detach())
         for i, mod in enumerate(self.layers):
-            mem = self.norm1[i](memories[i]) if self.normalize_before else memories[i]
+            if(memories is None):
+                mem = None
+            else:
+                mem = self.norm1[i](memories[i]) if self.normalize_before else memories[i]
             if caches is None:
-                output = mod(output,
-                        mem,
+                output = mod(mem, output,
                         tgt_mask=tgt_mask,
                         cache=None)
             else:
-                output, new_cache = mod(output,
-                        mem,
+                output, new_cache = mod(mem, output,
                         tgt_mask=tgt_mask,
                         cache=caches["cache"][i])
                 new_caches.append(new_cache)
-        if self.norm2 is not None:
+            new_memories.append(output.detach())
+        del new_memories[-1]
+
+        if self.normalize_before:
             output = self.norm2(output)
 
-        return output if caches is None else (output, new_caches)
+        return output, new_memories if caches is None else (output, new_memories, new_caches)
 
-    def gen_cache(self, memory, do_zip=False):
+    def gen_cache(self, tgt, do_zip=False):
         """
         Memory, tensor of [Batch, NumLayer, Sequence, Hidden]
         seg_idx, [0, seg_idx) represents the range of the memory
         """
-        cache = [layer.gen_cache(memory[i]) for (i, layer) in enumerate(self.layers)]
+        cache = [layer.gen_cache(tgt) for layer in self.layers]
         if do_zip:
             cache = list(zip(*cache))
         return cache

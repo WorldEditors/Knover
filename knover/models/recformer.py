@@ -22,7 +22,7 @@ from paddle.nn import TransformerDecoderLayer
 from knover.models import register_model
 from knover.core.model import Model
 from knover.modules.generator import Generator
-from knover.modules.recformer_block import RecFormerEncoder, RecFormerDecoder, RecFormerEncoderLayer
+from knover.modules.recformer_block import RecFormerEncoder, RecFormerEncoderLayer, MemAugDecoder, MemAugDecoderLayer
 from knover.utils import gather, str2bool
 
 
@@ -94,15 +94,15 @@ class RecFormer(Model):
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
         self.encoder = RecFormerEncoder(self.encoder_layer, self.n_layer)
 
-        self.decoder_layer = TransformerDecoderLayer(
+        self.decoder_layer = MemAugDecoderDecoderLayer(
             self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
-        self.aux_decoder_layer = TransformerDecoderLayer(
+        self.aux_decoder_layer = MemAugDecoderLayer(
             self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
 
-        self.decoder = RecFormerDecoder(self.decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
-        self.aux_decoder = RecFormerDecoder(self.aux_decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
+        self.decoder = MemAugDecoder(self.decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
+        self.aux_decoder = MemAugDecoder(self.aux_decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
 
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
@@ -222,10 +222,10 @@ class RecFormer(Model):
                 (rec_len, rec_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
 
             if(caches is not None):
-                output, caches = self.decoder(emb_input[:, _start:_end, :], self.memories, 
+                output, _, caches = self.decoder(emb_input[:, _start:_end, :], self.memories, 
                         tgt_mask=mask, cache=caches)
             else:
-                output = self.decoder(emb_input[:, _start:_end, :], self.memories, 
+                output, _ = self.decoder(emb_input[:, _start:_end, :], self.memories, 
                         tgt_mask=mask)
             outputs.append(output)
             self.memories = self.encoder(emb_input[:, _start:_end, :], self.memories)
@@ -236,7 +236,6 @@ class RecFormer(Model):
         if(caches is None):
             mask = paddle.tensor.triu((paddle.ones(
                 (_stop, _stop), dtype=paddle.get_default_dtype()) * -np.inf), 1)
-
             aux_outputs = self.aux_decoder(emb_input, self.memories, 
                     tgt_mask=mask)
 

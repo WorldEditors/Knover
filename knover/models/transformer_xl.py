@@ -18,7 +18,7 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 
-from paddle.nn import TransformerEncoder, TransformerEncoderLayer
+from knover.modules.recformer_block import MemAugDecoderLayer, MemAugDecoder
 from knover.models import register_model
 from knover.core.model import Model
 from knover.modules.generator import Generator
@@ -87,18 +87,16 @@ class TransformerXL(Model):
         self.normalize_before = args.get("normalize_before", True)
         self.hidden_act = args.hidden_act
 
-        encoder_layer = TransformerEncoderLayer(
+        decoder_layer = MemAugDecoderLayer(
             self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
 
         if not self.normalize_before:
             self.input_norm = nn.LayerNorm(self.hidden_size)
-            output_norm = None
         else:
             self.input_norm = None
-            output_norm = nn.LayerNorm(self.hidden_size)
 
-        self.encoder = TransformerEncoder(encoder_layer, self.n_layer, output_norm)
+        self.decoder = MemAugDecoder(decoder_layer, self.hidden_size, self.n_layer, self.normalize_before)
 
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
@@ -219,9 +217,9 @@ class TransformerXL(Model):
             (_stop, _stop), dtype=paddle.get_default_dtype()) * -1.0e+9), 1)
 
         if(caches is not None):
-            output, caches = self.encoder(emb_input, mask, cache=caches)
+            output, self.memories, caches = self.decoder(emb_input, self.memories, mask, cache=caches)
         else:
-            output = self.encoder(emb_input, mask)
+            output, self.memories = self.decoder(emb_input, self.memories, mask)
 
         # Re-concatenate all the results
 
@@ -308,4 +306,4 @@ class TransformerXL(Model):
         raise NotImplementedError
 
     def reset_memories(self, batch_size):
-        pass
+        self.memories = None
