@@ -18,6 +18,7 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 
+from knover.modules.disentangled_attention import RelPosLayer
 from knover.modules.recformer_block import MemAugDecoderLayer, MemAugDecoder
 from knover.models import register_model
 from knover.core.model import Model
@@ -50,8 +51,10 @@ class TransformerXL(Model):
 
         self.emb_size = args.get("emb_size", args.hidden_size)
         self.hidden_size = args.hidden_size
-        self.pos_size = args.max_position_embeddings
         self.dropout = args.hidden_dropout_prob
+        self.max_positions = args.max_positions
+        self.use_relative_position = args.use_relative_position
+        self.relative_k = args.relative_k
 
         self.n_layer = args.num_hidden_layers
         self.n_head = args.num_attention_heads
@@ -68,7 +71,14 @@ class TransformerXL(Model):
             self.type_embedding = nn.Embedding(self.type_size, self.emb_size, weight_attr=param_attr)
 
         self.token_embedding = nn.Embedding(self.vocab_size, self.emb_size, weight_attr=param_attr)
-        self.pos_embedding = nn.Embedding(self.pos_size, self.emb_size, weight_attr=param_attr)
+
+        # Use relative position layer or position embedding depending on use relative position or not
+        if(not self.use_relative_position):
+            self.pos_embedding = nn.Embedding(self.pos_size, self.emb_size, weight_attr=param_attr)
+            self.rel_pos_layer = None
+        else:
+            self.rel_pos_layer = RelPosLayer(max_positions=self.max_positions, rel_k = self.relative_k, 
+                    hidden_size = self.hidden_size, weight_attr=param_attr)
 
         # role embeddings
         self.use_role = args.use_role
@@ -88,7 +98,7 @@ class TransformerXL(Model):
         self.hidden_act = args.hidden_act
 
         decoder_layer = MemAugDecoderLayer(
-            self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
+            self.hidden_size, self.n_head, self.inner_hidden_size, rel_pos_layer=self.rel_pos_layer, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
 
         if not self.normalize_before:
@@ -132,12 +142,16 @@ class TransformerXL(Model):
         """
         batch_size = token_ids.shape[0]
         segment_length = token_ids.shape[1]
-        pos_ids = paddle.to_tensor([[i % segment_length for i in range(segment_length)]] * batch_size)
-        pos_ids = paddle.clip(pos_ids, max=self.pos_size-1)
 
-        token_emb_out = self.token_embedding(token_ids)
-        pos_emb_out = self.pos_embedding(pos_ids)
-        emb_out = token_emb_out + pos_emb_out
+        # use relative position embedding layers
+
+        emb_out = self.token_embedding(token_ids)
+
+        if(not self.use_relative_position):
+            pos_ids = paddle.to_tensor([[i % segment_length for i in range(segment_length)]] * batch_size)
+            pos_ids = paddle.clip(pos_ids, max=self.max_positions-1)
+            pos_emb_out = self.pos_embedding(pos_ids)
+            emb_out = emb_out + pos_emb_out
 
         if(self.type_embedding is not None):
             type_emb_out = self.type_embedding(type_ids)
@@ -209,17 +223,16 @@ class TransformerXL(Model):
             The output embeddings of Transformer.
         """
         outputs = []
-        _start = 0
-        _stop = emb_input.shape[1]
+        l_s = emb_input.shape[1]
 
         # Output size [Batch, SegLen, HiddenDim]
         mask = paddle.tensor.triu((paddle.ones(
-            (_stop, _stop), dtype=paddle.get_default_dtype()) * -1.0e+9), 1)
+            (l_s, l_s), dtype=paddle.get_default_dtype()) * -1.0e+10), 1)
 
         if(caches is not None):
-            output, self.memories, caches = self.decoder(emb_input, self.memories, mask, cache=caches)
+            self.memories, output, caches = self.decoder(self.memories, emb_input, mask, cache=caches)
         else:
-            output, self.memories = self.decoder(emb_input, self.memories, mask)
+            self.memories, output = self.decoder(self.memories, emb_input, mask)
 
         # Re-concatenate all the results
 

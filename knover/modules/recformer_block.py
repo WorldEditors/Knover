@@ -27,8 +27,8 @@ from paddle.fluid import layers
 from paddle.nn import Layer, LayerList
 from paddle.framework import ParamAttr
 from paddle.fluid.data_feeder import convert_dtype
-from paddle.nn import TransformerDecoderLayer, MultiHeadAttention
-from paddle.nn.layer.transformer import _convert_attention_mask, _convert_param_attr_to_list
+from paddle.nn.layer.transformer import _convert_attention_mask, _convert_param_attr_to_list, MultiHeadAttention
+from knover.modules.disentangled_attention import MultiHeadDisentangledAttention
 
 __all__ = []
 
@@ -43,13 +43,16 @@ class RecFormerEncoderLayer(Layer):
                  d_model,
                  nhead,
                  dim_feedforward,
+                 rel_pos_layer=None,
                  dropout=0.1,
                  activation="relu",
+                 position_emb=None,
                  attn_dropout=None,
                  act_dropout=None,
                  normalize_before=False,
                  weight_attr=None,
                  bias_attr=None):
+
         self._config = locals()
         self._config.pop("self")
         self._config.pop("__class__", None)  # py3
@@ -67,16 +70,29 @@ class RecFormerEncoderLayer(Layer):
         attn_dropout = dropout if attn_dropout is None else attn_dropout
         act_dropout = dropout if act_dropout is None else act_dropout
         self.normalize_before = normalize_before
+        #maximum position id in a segment
+        self.max_length = max_length
+        self.k = k
 
         weight_attrs = _convert_param_attr_to_list(weight_attr, 2)
         bias_attrs = _convert_param_attr_to_list(bias_attr, 2)
 
-        self.self_attn = MultiHeadAttention(
-            d_model,
-            nhead,
-            dropout=attn_dropout,
-            weight_attr=weight_attrs[0],
-            bias_attr=bias_attrs[0])
+        # Depending on whether to use relative positions, use MHDA or MHA
+        if(rel_pos_layer is None):
+            self.self_attn = MultiHeadAttention(
+                d_model,
+                nhead,
+                dropout=attn_dropout,
+                weight_attr=weight_attrs[0],
+                bias_attr=bias_attrs[0])
+        else:
+            self.self_attn = MultiHeadDisentangledAttention(
+                d_model,
+                nhead,
+                rel_pos_layer=rel_pos_layer,
+                dropout=attn_dropout,
+                weight_attr=weight_attrs[0],
+                bias_attr=bias_attrs[0])
 
         self.linear1 = Linear(
             d_model, dim_feedforward, weight_attrs[1], bias_attr=bias_attrs[1])
@@ -89,7 +105,7 @@ class RecFormerEncoderLayer(Layer):
         self.dropout2 = Dropout(dropout, mode="upscale_in_train")
         self.activation = getattr(F, activation)
 
-    def forward(self, src, memory, is_last_layer=False):
+    def forward(self, memory, src, is_last_layer=False):
         """
         src: source to be encoded into the memory, should be tensor of size [Batch, SeqLen, Hidden]
         memory: tensor of size [Batch, SegmentLen, Hidden]
@@ -97,7 +113,7 @@ class RecFormerEncoderLayer(Layer):
         """
         l_m = memory.shape[1]
         l_s = src.shape[1]
-        concat_src = paddle.concat(x=[src, memory], axis=1)
+        concat_src = paddle.concat(x=[memory, src], axis=1)
 
         if(not is_last_layer):
             residual = concat_src
@@ -109,9 +125,9 @@ class RecFormerEncoderLayer(Layer):
             normalized_mem = self.norm1(memory)
 
         if(not is_last_layer):
-            output = self.self_attn(concat_src, concat_src, concat_src, None)
+            output = self.self_attn(concat_src, concat_src, concat_src)
         else:
-            output = self.self_attn(normalized_mem, concat_src, concat_src, None)
+            output = self.self_attn(normalized_mem, concat_src, concat_src)
 
         output = residual + self.dropout1(output)
         if not self.normalize_before:
@@ -127,7 +143,7 @@ class RecFormerEncoderLayer(Layer):
         if not self.normalize_before:
             output = self.norm2(output)
 
-        return paddle.split(output, [l_s, l_m], axis=1) if(not is_last_layer) else output
+        return paddle.split(output, [l_m, l_s], axis=1) if(not is_last_layer) else output
 
 class RecFormerEncoder(Layer):
     """
@@ -141,11 +157,11 @@ class RecFormerEncoder(Layer):
     def __init__(self, encoder_layer, num_layers):
         super(RecFormerEncoder, self).__init__()
         self.layers = LayerList([(encoder_layer if i == 0 else
-                                  type(encoder_layer)(**encoder_layer._config))
-                                 for i in range(num_layers)])
+                type(encoder_layer)(**encoder_layer._config))
+                for i in range(num_layers)])
         self.num_layers = num_layers
 
-    def forward(self, src, memories):
+    def forward(self, memories, src):
         """
         src:  A tensor of shape [Batch, Sequence, Hidden]
         memories:  A NumLayers list of tensor of shape [Batch, Sequence, Hidden]
@@ -155,9 +171,9 @@ class RecFormerEncoder(Layer):
         new_memories = []
         output = src
         for i, mod in enumerate(self.layers[:-1]):
-            output, mem = mod(output, memories[i])
+            mem, output = mod(memories[i], output)
             new_memories.append(mem)
-        mem = self.layers[-1](output, memories[self.num_layers-1], is_last_layer=True)
+        mem = self.layers[-1](memories[self.num_layers-1], output, is_last_layer=True)
         new_memories.append(mem)
 
         return new_memories
@@ -172,6 +188,7 @@ class MemAugDecoderLayer(Layer):
                  d_model,
                  nhead,
                  dim_feedforward,
+                 rel_pos_layer=None,
                  dropout=0.1,
                  activation="relu",
                  attn_dropout=None,
@@ -201,12 +218,21 @@ class MemAugDecoderLayer(Layer):
         weight_attrs = _convert_param_attr_to_list(weight_attr, 2)
         bias_attrs = _convert_param_attr_to_list(bias_attr, 2)
 
-        self.self_attn = MultiHeadAttention(
-            d_model,
-            nhead,
-            dropout=attn_dropout,
-            weight_attr=weight_attrs[0],
-            bias_attr=bias_attrs[0])
+        if(rel_pos_layer is None):
+            self.self_attn = MultiHeadAttention(
+                d_model,
+                nhead,
+                dropout=attn_dropout,
+                weight_attr=weight_attrs[0],
+                bias_attr=bias_attrs[0])
+        else:
+            self.self_attn = MultiHeadDisentangledAttention(
+                d_model,
+                nhead,
+                rel_pos_layer=rel_pos_layer,
+                dropout=attn_dropout,
+                weight_attr=weight_attrs[0],
+                bias_attr=bias_attrs[0])
 
         self.linear1 = Linear(
             d_model, dim_feedforward, weight_attrs[1], bias_attr=bias_attrs[1])
@@ -239,11 +265,11 @@ class MemAugDecoderLayer(Layer):
             tgt = self.norm1(tgt)
             concat_src = self.norm1(concat_src)
 
-        # Add cache for encoder for the usage like UniLM
+        # Notice that the key position starts from -l_m here 
         if(cache is None):
-            output = self.self_attn(tgt, concat_src, concat_src, tgt_mask)
+            output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, key_pos_start_idx=-l_m)
         else:
-            output, new_cache = self.self_attn(tgt, concat_src, concat_src, tgt_mask, cache)
+            output, new_cache = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, key_pos_start_idx=-l_m, cache=cache)
         residual = tgt
 
         output = residual + self.dropout1(output)
@@ -265,21 +291,22 @@ class MemAugDecoderLayer(Layer):
     def gen_cache(self, tgt):
         incremental_cache = self.self_attn.gen_cache(
                 src, type=self.self_attn.Cache)
-        return increamental_cache
+        return incremental_cache
 
 class MemAugDecoder(Layer):
     def __init__(self, decoder_layer, d_model, num_layers, normalize_before=False):
         super(MemAugDecoder, self).__init__()
         self.layers = LayerList([(decoder_layer if i == 0 else
-                                  type(decoder_layer)(**decoder_layer._config))
-                                 for i in range(num_layers)])
+                type(decoder_layer)(**decoder_layer._config))
+                for i in range(num_layers)])
+
         self.num_layers = num_layers
         self.normalize_before = normalize_before
         if(self.normalize_before):
             self.norm1 = [LayerNorm(d_model) for i in range(num_layers)]
             self.norm2 = LayerNorm(d_model) 
 
-    def forward(self, tgt, memories, tgt_mask=None, caches=None):
+    def forward(self, memories, tgt, tgt_mask=None, caches=None):
         """
         tgt:  A tensor of shape [Batch, Sequence, Hidden]
         memories:  A NumLayers list of tensor of shape [Batch, Sequence, Hidden]
@@ -316,7 +343,7 @@ class MemAugDecoder(Layer):
         if self.normalize_before:
             output = self.norm2(output)
 
-        return output, new_memories if caches is None else (output, new_memories, new_caches)
+        return new_memories, output if caches is None else (new_memories, output, new_caches)
 
     def gen_cache(self, tgt, do_zip=False):
         """
