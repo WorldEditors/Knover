@@ -28,7 +28,7 @@ from paddle.nn import Layer, LayerList
 from paddle.framework import ParamAttr
 from paddle.fluid.data_feeder import convert_dtype
 from paddle.nn.layer.transformer import _convert_attention_mask, _convert_param_attr_to_list, MultiHeadAttention
-from knover.modules.disentangled_attention import MultiHeadDisentangledAttention
+from knover.modules.rel_pos_attention import MultiHeadRelPosAttention
 
 __all__ = []
 
@@ -86,7 +86,7 @@ class RecFormerEncoderLayer(Layer):
                 weight_attr=weight_attrs[0],
                 bias_attr=bias_attrs[0])
         else:
-            self.self_attn = MultiHeadDisentangledAttention(
+            self.self_attn = MultiHeadRelPosAttention(
                 d_model,
                 nhead,
                 rel_pos_layer=rel_pos_layer,
@@ -226,7 +226,7 @@ class MemAugDecoderLayer(Layer):
                 weight_attr=weight_attrs[0],
                 bias_attr=bias_attrs[0])
         else:
-            self.self_attn = MultiHeadDisentangledAttention(
+            self.self_attn = MultiHeadRelPosAttention(
                 d_model,
                 nhead,
                 rel_pos_layer=rel_pos_layer,

@@ -18,7 +18,7 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 
-from knover.modules.disentangled_attention import RelPosLayer
+from knover.modules.rel_pos_attention import RelPosLayer
 from knover.modules.recformer_block import MemAugDecoderLayer, MemAugDecoder
 from knover.models import register_model
 from knover.core.model import Model

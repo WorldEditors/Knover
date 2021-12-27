@@ -62,13 +62,12 @@ class RelPosLayer(Layer):
             attr=weight_attr,
             dtype=self._dtype,
             is_bias=False)
-        print(self.position_map)
         print("Relative Position Parameters successfully initialized")
 
 
-class MultiHeadDisentangledAttention(Layer):
+class MultiHeadRelPosAttention(Layer):
     """
-    Relative Position Embedded Layer
+    Relative Position Attention Layer 
 
     Parameters:
         embed_dim (int): The expected feature size in the input and output.
@@ -119,7 +118,7 @@ class MultiHeadDisentangledAttention(Layer):
                  need_weights=False,
                  weight_attr=None,
                  bias_attr=None):
-        super(MultiHeadDisentangledAttention, self).__init__()
+        super(MultiHeadRelPosAttention, self).__init__()
 
         assert embed_dim > 0, ("Expected embed_dim to be greater than 0, "
                                "but recieved {}".format(embed_dim))
@@ -381,10 +380,12 @@ class MultiHeadDisentangledAttention(Layer):
         value = query if value is None else value
 
         # calculate the query / key absolute position id
-        q_s_i = 0
-        q_e_i = query.shape[1]
-        k_s_i = key_pos_start_idx
-        k_e_i = key_pos_start_idx + key.shape[1]
+        q_s_i = - min(key_pos_start_idx, 0)
+        q_e_i = q_s_i + query.shape[1]
+        k_s_i = q_s_i + key_pos_start_idx
+        k_e_i = k_s_i + key.shape[1]
+        assert (max(q_s_i, q_e_i, k_s_i, k_e_i) < self.rel_pos_layer.max_pos), \
+                "position out of range, inproper max_pos setting"
 
         # extract the position map correpsonding to the current query and key position
         # shape: `[q_seq_length, k_seq_length, 2k]`
@@ -397,31 +398,33 @@ class MultiHeadDisentangledAttention(Layer):
             q, k, v, qr, kr, cache = self._prepare_qkv(query, key, value, cache)
 
         # Turn qr, kr to `[batch_size, num_heads, 2k, d_heads]`
-        print(qr.shape, kr.shape)
-        qr = paddle.expand(qr, shape=(q.shape[0], qr.shape[0], qr.shape[1], qr.shape[2]))
-        kr = paddle.expand(kr, shape=(k.shape[0], kr.shape[0], kr.shape[1], kr.shape[2]))
+        nb = q.shape[0]
+        nh, nk, dh = qr.shape
+        lq = q_e_i - q_s_i
+        lk = k_e_i - k_s_i
+        qr = paddle.expand(qr, shape=(nb, nh, nk, dh))
+        kr = paddle.expand(kr, shape=(nb, nh, nk, dh))
+
+        # prepare position mapping indexes `[batch_size, num_heads, q_length, k_length]`
+        exp_pos_mat = paddle.expand(pos_mat, shape=(nb, nh, lq, lk))
+        pkr = paddle.reshape(exp_pos_mat, shape=(-1, lk))
+        pqr = paddle.reshape(paddle.transpose(exp_pos_mat, perm=[0,1,3,2]), shape=(-1, lq))
 
         # scale dot product attention
         # TODO(guosheng): use tensor.matmul, however it doesn't support `alpha`
         # prod_cc: `[batch_size, num_heads, q_seq_length, k_seq_length]`
         prod_cc = layers.matmul(
             x=q, y=k, transpose_y=True, alpha=self.head_dim**-0.5)
-        # prod_cp: `[batch_size, num_heads, q_seq_length, 2k]`
-        prod_cp_pre = layers.matmul(
-            x=q, y=kr, transpose_y=True, alpha=self.head_dim**-0.5)
-        # prod_pc: `[batch_size, num_heads, q_seq_length, 2k]`
-        prod_pc_pre = layers.matmul(
-            x=k, y=qr, transpose_y=True, alpha=self.head_dim**-0.5)
-
-        print("start calculating prod_cp & prod_pc")
-        prod_cp = paddle.zeros(shape=prod_cc.shape)
-        prod_pc = paddle.zeros(shape=prod_cc.shape)
-        print(prod_cp_pre.shape, prod_pc_pre.shape)
-        for i in range(q_e_i-q_s_i):
-            for j in range(k_e_i- k_s_i):
-                prod_cp[:, :, i, j] += prod_cp_pre[:, :, i, pos_mat[i, j]]
-                prod_pc[:, :, i, j] += prod_pc_pre[:, :, i, pos_mat[j, i]]
-        print("finish calculating prod_cp & prod_pc")
+        # prod_cp: `[batch_size * num_heads * q_seq_length, k_seq_length]`
+        prod_cp = paddle.reshape(layers.matmul(
+            x=q, y=kr, transpose_y=True, alpha=self.head_dim**-0.5), shape=(-1, nk))
+        prod_cp = paddle.index_sample(prod_cp, pkr)
+        prod_cp = paddle.reshape(prod_cp, [nb, nh, lq, lk])
+        # prod_pc: `[batch_size, num_heads, q_seq_length, k_seq_length]`
+        prod_pc = paddle.reshape(layers.matmul(
+            x=k, y=qr, transpose_y=True, alpha=self.head_dim**-0.5), shape=(-1, nk))
+        prod_pc = paddle.index_sample(prod_pc, pqr)
+        prod_pc = paddle.transpose(paddle.reshape(prod_pc, [nb, nh, lk, lq]), perm=[0,1,3,2])
 
         # final attention before attn_mask
         # finally add to shape `[batch_size, num_heads, q_seq_length, k_seq_length]`
