@@ -7,7 +7,7 @@
   "attention_probs_dropout_prob": 0.1,
   "hidden_act": "gelu",
   "max_positions": 301,
-  "use_relative_position": true,
+  "use_relative_position": false,
   "relative_k": 150,
   "hidden_dropout_prob": 0.1,
   "hidden_size": 410,

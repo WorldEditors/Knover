@@ -219,6 +219,7 @@ class MemAugDecoderLayer(Layer):
         bias_attrs = _convert_param_attr_to_list(bias_attr, 2)
 
         if(rel_pos_layer is None):
+            self.use_rel_pos = False
             self.self_attn = MultiHeadAttention(
                 d_model,
                 nhead,
@@ -226,6 +227,7 @@ class MemAugDecoderLayer(Layer):
                 weight_attr=weight_attrs[0],
                 bias_attr=bias_attrs[0])
         else:
+            self.use_rel_pos = True
             self.self_attn = MultiHeadRelPosAttention(
                 d_model,
                 nhead,
@@ -266,10 +268,17 @@ class MemAugDecoderLayer(Layer):
             concat_src = self.norm1(concat_src)
 
         # Notice that the key position starts from -l_m here 
-        if(cache is None):
-            output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, key_pos_start_idx=-l_m)
+        if(self.use_rel_pos):
+            if(cache is None):
+                output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, key_pos_start_idx=-l_m)
+            else:
+                output, new_cache = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, key_pos_start_idx=-l_m, cache=cache)
         else:
-            output, new_cache = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, key_pos_start_idx=-l_m, cache=cache)
+            if(cache is None):
+                output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask)
+            else:
+                output, new_cache = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, cache=cache)
+
         residual = tgt
 
         output = residual + self.dropout1(output)

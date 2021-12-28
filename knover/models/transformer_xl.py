@@ -74,7 +74,7 @@ class TransformerXL(Model):
 
         # Use relative position layer or position embedding depending on use relative position or not
         if(not self.use_relative_position):
-            self.pos_embedding = nn.Embedding(self.pos_size, self.emb_size, weight_attr=param_attr)
+            self.pos_embedding = nn.Embedding(self.max_positions, self.emb_size, weight_attr=param_attr)
             self.rel_pos_layer = None
         else:
             self.rel_pos_layer = RelPosLayer(max_positions=self.max_positions, rel_k = self.relative_k, 
