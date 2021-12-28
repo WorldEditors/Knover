@@ -23,7 +23,6 @@ from paddle.nn import Linear, Dropout
 from paddle.nn import LayerNorm
 from paddle.nn import functional as F
 from paddle import tensor
-from paddle.fluid import layers
 from paddle.nn import Layer, LayerList
 from paddle.framework import ParamAttr
 from paddle.nn.layer.transformer import _convert_attention_mask, _convert_param_attr_to_list
@@ -195,8 +194,8 @@ class MultiHeadRelPosAttention(Layer):
         q = tensor.reshape(x=q, shape=[0, 0, self.num_heads, self.head_dim])
         q = tensor.transpose(x=q, perm=[0, 2, 1, 3])
         qr = self.qr_proj(self.rel_pos_layer.position_emb)
-        qr = tensor.reshape(x=qr, shape=[0, self.num_heads, self.head_dim])
-        qr = tensor.transpose(x=qr, perm=[1, 0, 2])
+        qr = tensor.reshape(x=qr, shape=[0, -1, self.num_heads, self.head_dim])
+        qr = tensor.transpose(x=qr, perm=[1, 2, 0, 3])
 
         if isinstance(cache, self.StaticCache):
             # for encoder-decoder attention in inference and has cached
@@ -245,8 +244,8 @@ class MultiHeadRelPosAttention(Layer):
         k = tensor.transpose(x=k, perm=[0, 2, 1, 3])
         v = tensor.reshape(x=v, shape=[0, 0, self.num_heads, self.head_dim])
         v = tensor.transpose(x=v, perm=[0, 2, 1, 3])
-        kr = tensor.reshape(x=kr, shape=[0, self.num_heads, self.head_dim])
-        kr = tensor.transpose(x=kr, perm=[1, 0, 2])
+        kr = tensor.reshape(x=kr, shape=[0, -1, self.num_heads, self.head_dim])
+        kr = tensor.transpose(x=kr, perm=[1, 2, 0, 3])
         return k, v, kr
 
     def gen_cache(self, key, value=None, type=Cache):
@@ -399,32 +398,46 @@ class MultiHeadRelPosAttention(Layer):
 
         # Turn qr, kr to `[batch_size, num_heads, 2k, d_heads]`
         nb = q.shape[0]
-        nh, nk, dh = qr.shape
+        _, nh, nk, dh = qr.shape
         lq = q_e_i - q_s_i
         lk = k_e_i - k_s_i
-        qr = paddle.expand(qr, shape=(nb, nh, nk, dh))
-        kr = paddle.expand(kr, shape=(nb, nh, nk, dh))
 
         # prepare position mapping indexes `[batch_size, num_heads, q_length, k_length]`
-        exp_pos_mat = paddle.expand(pos_mat, shape=(nb, nh, lq, lk))
-        pkr = paddle.reshape(exp_pos_mat, shape=(-1, lk))
-        pqr = paddle.reshape(paddle.transpose(exp_pos_mat, perm=[0,1,3,2]), shape=(-1, lq))
+        pkr = paddle.expand(pos_mat, shape=(nb, nh, lq, lk))
+        # prepare position mapping indexes `[batch_size, num_heads, k_length, q_length]`
+        pqr = paddle.transpose(pkr, perm=[0,1,3,2])
 
+        pkr = paddle.reshape(pkr, shape=(-1, lk))
+        pqr = paddle.reshape(pqr, shape=(-1, lq))
+        
+        alpha = self.head_dim**-0.5
         # scale dot product attention
         # TODO(guosheng): use tensor.matmul, however it doesn't support `alpha`
         # prod_cc: `[batch_size, num_heads, q_seq_length, k_seq_length]`
-        prod_cc = layers.matmul(
-            x=q, y=k, transpose_y=True, alpha=self.head_dim**-0.5)
-        # prod_cp: `[batch_size * num_heads * q_seq_length, k_seq_length]`
-        prod_cp = paddle.reshape(layers.matmul(
-            x=q, y=kr, transpose_y=True, alpha=self.head_dim**-0.5), shape=(-1, nk))
+        prod_cc = alpha * paddle.matmul(x=q, y=k, transpose_y=True)
+        # prod_cp
+        # multiply `[batch_size, num_heads, q_seq_length, d_head]` and `[num_heads, nk, d_head]`
+        # acquiring `[batch_size, num_heads, q_seq_length, nk]`
+        prod_cp = alpha * paddle.matmul(x=q, y=kr, transpose_y=True)
+        # acquiring `[batch_size * num_heads * q_seq_length, nk]`
+        prod_cp = paddle.reshape(prod_cp, shape=(-1, nk))
+        # acquiring `[batch_size * num_heads * q_seq_length, k_seq_length]`
         prod_cp = paddle.index_sample(prod_cp, pkr)
+        # acquiring `[batch_size, num_heads, q_seq_length, k_seq_length]`
         prod_cp = paddle.reshape(prod_cp, [nb, nh, lq, lk])
-        # prod_pc: `[batch_size, num_heads, q_seq_length, k_seq_length]`
-        prod_pc = paddle.reshape(layers.matmul(
-            x=k, y=qr, transpose_y=True, alpha=self.head_dim**-0.5), shape=(-1, nk))
+
+        # prod_pc
+        # multiply `[batch_size, num_heads, k_seq_length, d_head]` and `[num_heads, nk, d_head]`
+        # acquiring `[batch_size, num_heads, k_seq_length, nk]`
+        prod_pc = alpha * paddle.matmul(x=k, y=qr, transpose_y=True)
+        # acquiring `[batch_size * num_heads * k_seq_length, nk]`
+        prod_pc = paddle.reshape(prod_pc, shape=(-1, nk))
+        # acquiring `[batch_size * num_heads * k_seq_length, q_seq_length]`
         prod_pc = paddle.index_sample(prod_pc, pqr)
-        prod_pc = paddle.transpose(paddle.reshape(prod_pc, [nb, nh, lk, lq]), perm=[0,1,3,2])
+        # acquiring `[batch_size, num_heads, k_seq_length, q_seq_length]`
+        prod_pc = paddle.reshape(prod_pc, [nb, nh, lk, lq])
+        # acquiring `[batch_size, num_heads, q_seq_length, k_seq_length]`
+        prod_pc = paddle.transpose(prod_pc, perm=[0,1,3,2])
 
         # final attention before attn_mask
         # finally add to shape `[batch_size, num_heads, q_seq_length, k_seq_length]`

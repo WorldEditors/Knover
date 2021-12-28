@@ -93,6 +93,9 @@ class TransformerXL(Model):
         if self.emb_mapping_in:
             self.emb_mapping_fc = nn.Linear(self.emb_size, self.hidden_size, weight_attr=param_attr)
 
+        # memories
+        self.memories = None
+
         # transformer encoder
         self.normalize_before = args.get("normalize_before", True)
         self.hidden_act = args.hidden_act
@@ -148,7 +151,7 @@ class TransformerXL(Model):
         emb_out = self.token_embedding(token_ids)
 
         if(not self.use_relative_position):
-            pos_ids = paddle.to_tensor([[i % segment_length for i in range(segment_length)]] * batch_size)
+            pos_ids = paddle.to_tensor([list(range(segment_length))] * batch_size)
             pos_ids = paddle.clip(pos_ids, max=self.max_positions-1)
             pos_emb_out = self.pos_embedding(pos_ids)
             emb_out = emb_out + pos_emb_out

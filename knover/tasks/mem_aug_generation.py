@@ -33,7 +33,6 @@ class MemAugGeneration(DialogGeneration):
     def __init__(self, args):
         super(MemAugGeneration, self).__init__(args)
         self.reader = LongTextReader(args)
-        self.memories = None
         self.validation_step = args.validation_step
         self.step = 0
         if(self.reader.use_role):
@@ -61,7 +60,6 @@ class MemAugGeneration(DialogGeneration):
         fin_outputs = {"token_lm_loss": 0.0, "token_aux_loss": 0.0, "loss": 0.0, "ready_for_validation": False}
         seg_num = inputs["seg_num"]
         sum_lm_mask = 0.0
-        #print("batch and segments:", inputs["batch_size"], inputs["segment_lengths"][0])
 
         for i in range(inputs["seg_num"]):
             #avoiding large memories, do some detach
