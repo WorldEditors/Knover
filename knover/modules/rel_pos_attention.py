@@ -35,34 +35,35 @@ class RelPosLayer(Layer):
     Layer For Relative Position Embeddings
     """
     def __init__(self,
-            max_positions=256,
-            rel_k=64,
-            hidden_size=512,
+            rel_min = - 128,
+            rel_max = 128,
+            emb_size = 512,
             weight_attr=None,
             ):
-
+        """
+        relative position is valid between [rel_min, rel_max)
+        """
         super(RelPosLayer, self).__init__()
-        assert rel_k > 0, ("Expected relative_k to be greater than 0, "
-                               "but recieved {}".format(rel_k))
-        assert max_positions > 0, ("Expected max_positions to be greater than 0, "
-                               "but recieved {}".format(max_positions))
+        assert rel_max > rel_min, "relative position max must be larger than min"
+
         # generate the position mapping matrix
-        self.max_pos = max_positions
-        self.rel_k = rel_k
-        self.position_map = paddle.zeros(shape=(self.max_pos, self.max_pos), dtype="int64")
-        for delta in range(1 - self.max_pos, self.max_pos):
-            sigma_ij = max(min(delta + self.rel_k, 2 * self.rel_k - 1), 0)
-            for i in range(max(-delta, 0), min(self.max_pos - delta, self.max_pos)):
-                self.position_map[i, i + delta] = sigma_ij
+        self.rel_min = rel_min
+        self.rel_max = rel_max
+        self.emb_size = emb_size
+        self.emb_num = rel_max - rel_min
 
         # create a position embedding parameter
         self.position_emb = self.create_parameter(
-            shape=[2 * self.rel_k, hidden_size],
+            shape=[self.emb_num, self.emb_size],
             attr=weight_attr,
             dtype=self._dtype,
             is_bias=False)
-        print("Relative Position Parameters successfully initialized")
 
+    def relative_pos_2_emb(self, rel_pos_k_q):
+        return rel_pos_k_q - self.rel_min
+
+    def emb_2_relative_pos(self, idx):
+        return idx + self.rel_min
 
 class MultiHeadRelPosAttention(Layer):
     """
@@ -143,8 +144,6 @@ class MultiHeadRelPosAttention(Layer):
             self.vdim, embed_dim, weight_attr, bias_attr=bias_attr)
         self.out_proj = Linear(
             embed_dim, embed_dim, weight_attr, bias_attr=bias_attr)
-        self.qr_proj = Linear(
-            self.pdim, embed_dim, weight_attr, bias_attr=bias_attr)
         self.kr_proj = Linear(
             self.pdim, embed_dim, weight_attr, bias_attr=bias_attr)
 
@@ -193,26 +192,25 @@ class MultiHeadRelPosAttention(Layer):
         q = self.q_proj(query)
         q = tensor.reshape(x=q, shape=[0, 0, self.num_heads, self.head_dim])
         q = tensor.transpose(x=q, perm=[0, 2, 1, 3])
-        qr = self.qr_proj(self.rel_pos_layer.position_emb)
-        qr = tensor.reshape(x=qr, shape=[0, -1, self.num_heads, self.head_dim])
-        qr = tensor.transpose(x=qr, perm=[1, 2, 0, 3])
+        kr = self.kr_proj(self.rel_pos_layer.position_emb)
+        kr = tensor.reshape(x=kr, shape=[0, -1, self.num_heads, self.head_dim])
+        kr = tensor.transpose(x=kr, perm=[1, 2, 0, 3])
 
         if isinstance(cache, self.StaticCache):
             # for encoder-decoder attention in inference and has cached
-            k, v, kr = cache.k, cache.v, cache.kr
+            k, v = cache.k, cache.v
         else:
-            k, v, kr = self.compute_kvr(key, value)
+            k, v = self.compute_kv(key, value)
 
         if isinstance(cache, self.Cache):
             # for decoder self-attention in inference
             k = tensor.concat([cache.k, k], axis=2)
             v = tensor.concat([cache.v, v], axis=2)
-            kr = tensor.concat([cache.kr, kr], axis=2)
-            cache = self.Cache(k, v, kr)
+            cache = self.Cache(k, v)
 
-        return (q, k, v, qr, kr) if cache is None else (q, k, v, qr, kr, cache)
+        return (q, k, v, kr) if cache is None else (q, k, v, kr, cache)
 
-    def compute_kvr(self, key, value):
+    def compute_kv(self, key, value):
         r"""
         Applies linear projection on input keys and values, then splits heads
         (reshape and transpose) to get keys and values from different representation
@@ -239,14 +237,11 @@ class MultiHeadRelPosAttention(Layer):
         """
         k = self.k_proj(key)
         v = self.v_proj(value)
-        kr = self.kr_proj(self.rel_pos_layer.position_emb)
         k = tensor.reshape(x=k, shape=[0, 0, self.num_heads, self.head_dim])
         k = tensor.transpose(x=k, perm=[0, 2, 1, 3])
         v = tensor.reshape(x=v, shape=[0, 0, self.num_heads, self.head_dim])
         v = tensor.transpose(x=v, perm=[0, 2, 1, 3])
-        kr = tensor.reshape(x=kr, shape=[0, -1, self.num_heads, self.head_dim])
-        kr = tensor.transpose(x=kr, perm=[1, 2, 0, 3])
-        return k, v, kr
+        return k, v
 
     def gen_cache(self, key, value=None, type=Cache):
         """
@@ -298,8 +293,8 @@ class MultiHeadRelPosAttention(Layer):
             namedtuple: an instance of `Cache` or `StaticCache` accordingly.
         """
         if type == MultiHeadAttention.StaticCache:  # static_kv
-            k, v, kr = self.compute_kvr(key, value)
-            return self.StaticCache(k, v, kr)
+            k, v = self.compute_kv(key, value)
+            return self.StaticCache(k, v)
         elif value is None:  # incremental_state
             k = layers.fill_constant_batch_size_like(
                 input=key,
@@ -311,17 +306,12 @@ class MultiHeadRelPosAttention(Layer):
                 shape=[-1, self.num_heads, 0, self.head_dim],
                 dtype=key.dtype,
                 value=0)
-            kr = layers.fill_constant_batch_size_like(
-                input=key[0],
-                shape=[-1, 0, self.head_dim],
-                dtype=key.dtype,
-                value=0)
-            return self.Cache(k, v, kr)
+            return self.Cache(k, v)
         else:
             # incremental_state with initial value, mainly for usage like UniLM
-            return self.Cache(key, value, kr)
+            return self.Cache(key, value)
 
-    def forward(self, query, key=None, value=None, key_pos_start_idx=0, attn_mask=None, cache=None):
+    def forward(self, query, key=None, value=None, rel_pos_start_key=0, attn_mask=None, cache=None):
         r"""
         Applies multi-head attention to map queries and a set of key-value pairs
         to outputs.
@@ -379,37 +369,30 @@ class MultiHeadRelPosAttention(Layer):
         value = query if value is None else value
 
         # calculate the query / key absolute position id
-        q_s_i = - min(key_pos_start_idx, 0)
-        q_e_i = q_s_i + query.shape[1]
-        k_s_i = q_s_i + key_pos_start_idx
-        k_e_i = k_s_i + key.shape[1]
-        assert (max(q_s_i, q_e_i, k_s_i, k_e_i) < self.rel_pos_layer.max_pos), \
-                "position out of range, inproper max_pos setting"
-
-        # extract the position map correpsonding to the current query and key position
-        # shape: `[q_seq_length, k_seq_length, 2k]`
-        pos_mat = self.rel_pos_layer.position_map[q_s_i:q_e_i, k_s_i:k_e_i]
+        # rel_min: -20
+        # rel_max: +10
+        # emb_num: +30
+        # rel_pos_start_key: -10
+        nb = query.shape[0]
+        l_q = query.shape[1] # 10
+        l_k = key.shape[1] # 20
+        rel_s = rel_pos_start_key - l_q # -20
+        rel_e = rel_pos_start_key + l_k # +10
+        
+        pos_emb_s = self.rel_pos_layer.relative_pos_2_emb(rel_s) # 0
+        pos_emb_e = self.rel_pos_layer.relative_pos_2_emb(rel_e) # 30
+        max_pos_emb = self.rel_pos_layer.emb_num # 30
+        max_pos_span = l_q + l_k # 30
+        
+        s_fill = pos_emb_s # 0
+        e_fill = max_pos_emb - pos_emb_e # 0
 
         # compute q ,k ,v
         if cache is None:
-            q, k, v, qr, kr = self._prepare_qkv(query, key, value, cache)
+            q, k, v, kr = self._prepare_qkv(query, key, value, cache)
         else:
-            q, k, v, qr, kr, cache = self._prepare_qkv(query, key, value, cache)
+            q, k, v, kr, cache = self._prepare_qkv(query, key, value, cache)
 
-        # Turn qr, kr to `[batch_size, num_heads, 2k, d_heads]`
-        nb = q.shape[0]
-        _, nh, nk, dh = qr.shape
-        lq = q_e_i - q_s_i
-        lk = k_e_i - k_s_i
-
-        # prepare position mapping indexes `[batch_size, num_heads, q_length, k_length]`
-        pkr = paddle.expand(pos_mat, shape=(nb, nh, lq, lk))
-        # prepare position mapping indexes `[batch_size, num_heads, k_length, q_length]`
-        pqr = paddle.transpose(pkr, perm=[0,1,3,2])
-
-        pkr = paddle.reshape(pkr, shape=(-1, lk))
-        pqr = paddle.reshape(pqr, shape=(-1, lq))
-        
         alpha = self.head_dim**-0.5
         # scale dot product attention
         # TODO(guosheng): use tensor.matmul, however it doesn't support `alpha`
@@ -417,31 +400,34 @@ class MultiHeadRelPosAttention(Layer):
         prod_cc = alpha * paddle.matmul(x=q, y=k, transpose_y=True)
         # prod_cp
         # multiply `[batch_size, num_heads, q_seq_length, d_head]` and `[num_heads, nk, d_head]`
-        # acquiring `[batch_size, num_heads, q_seq_length, nk]`
+        # acquiring `[batch_size, num_heads, q_seq_length, max_pos_emb]`
         prod_cp = alpha * paddle.matmul(x=q, y=kr, transpose_y=True)
-        # acquiring `[batch_size * num_heads * q_seq_length, nk]`
-        prod_cp = paddle.reshape(prod_cp, shape=(-1, nk))
-        # acquiring `[batch_size * num_heads * q_seq_length, k_seq_length]`
-        prod_cp = paddle.index_sample(prod_cp, pkr)
-        # acquiring `[batch_size, num_heads, q_seq_length, k_seq_length]`
-        prod_cp = paddle.reshape(prod_cp, [nb, nh, lq, lk])
 
-        # prod_pc
-        # multiply `[batch_size, num_heads, k_seq_length, d_head]` and `[num_heads, nk, d_head]`
-        # acquiring `[batch_size, num_heads, k_seq_length, nk]`
-        prod_pc = alpha * paddle.matmul(x=k, y=qr, transpose_y=True)
-        # acquiring `[batch_size * num_heads * k_seq_length, nk]`
-        prod_pc = paddle.reshape(prod_pc, shape=(-1, nk))
-        # acquiring `[batch_size * num_heads * k_seq_length, q_seq_length]`
-        prod_pc = paddle.index_sample(prod_pc, pqr)
-        # acquiring `[batch_size, num_heads, k_seq_length, q_seq_length]`
-        prod_pc = paddle.reshape(prod_pc, [nb, nh, lk, lq])
-        # acquiring `[batch_size, num_heads, q_seq_length, k_seq_length]`
-        prod_pc = paddle.transpose(prod_pc, perm=[0,1,3,2])
+        # acquiring `[batch_size, num_heads, q_seq_length, max_pos_span]` 10, 30
+        # by adding / slicing the rows out of range
+        INT_MAX = 100000 # s_fill = -99, e_fill = 51
+        if(s_fill > 0):
+            prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, s_fill], [INT_MAX, INT_MAX, INT_MAX, INT_MAX])
+        elif(s_fill < 0):
+            fill_vec_s = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, 0], [INT_MAX, INT_MAX, INT_MAX, 1])
+            fill_vec_s = paddle.tile(fill_vec_s, repeat_times=[1, 1, 1, -s_fill])
+            prod_cp = paddle.concat([fill_vec_s, prod_cp], axis=-1)
+        if(e_fill > 0):
+            prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, 0], [INT_MAX, INT_MAX, INT_MAX, -e_fill])
+        elif(e_fill < 0):
+            fill_vec_e = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, -1], [INT_MAX, INT_MAX, INT_MAX, INT_MAX])
+            fill_vec_e = paddle.tile(fill_vec_e, repeat_times=[1, 1, 1, -e_fill])
+            prod_cp = paddle.concat([prod_cp, fill_vec_e], axis=-1)
+
+        # Doing Relative shift
+        prod_cp = paddle.reshape(prod_cp, shape=(nb, self.num_heads, max_pos_span, l_q))
+        prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 1, 0], [INT_MAX, INT_MAX, INT_MAX, INT_MAX])
+        prod_cp = paddle.reshape(prod_cp, shape=(nb, self.num_heads, l_q, max_pos_span - 1))
+        prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, 0], [INT_MAX, INT_MAX, INT_MAX, l_k])
 
         # final attention before attn_mask
         # finally add to shape `[batch_size, num_heads, q_seq_length, k_seq_length]`
-        product = prod_cc + prod_cp + prod_pc
+        product = prod_cc + prod_cp
 
         if attn_mask is not None:
             # Support bool or int mask

@@ -270,9 +270,9 @@ class MemAugDecoderLayer(Layer):
         # Notice that the key position starts from -l_m here 
         if(self.use_rel_pos):
             if(cache is None):
-                output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, key_pos_start_idx=-l_m)
+                output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, rel_pos_start_key=-l_m)
             else:
-                output, new_cache = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, key_pos_start_idx=-l_m, cache=cache)
+                output, new_cache = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, rel_pos_start_key=-l_m, cache=cache)
         else:
             if(cache is None):
                 output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask)

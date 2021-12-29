@@ -52,9 +52,9 @@ class TransformerXL(Model):
         self.emb_size = args.get("emb_size", args.hidden_size)
         self.hidden_size = args.hidden_size
         self.dropout = args.hidden_dropout_prob
-        self.max_positions = args.max_positions
+        self.relative_position_min = args.relative_position_min
+        self.relative_position_max = args.relative_position_max
         self.use_relative_position = args.use_relative_position
-        self.relative_k = args.relative_k
 
         self.n_layer = args.num_hidden_layers
         self.n_head = args.num_attention_heads
@@ -77,8 +77,9 @@ class TransformerXL(Model):
             self.pos_embedding = nn.Embedding(self.max_positions, self.emb_size, weight_attr=param_attr)
             self.rel_pos_layer = None
         else:
-            self.rel_pos_layer = RelPosLayer(max_positions=self.max_positions, rel_k = self.relative_k, 
-                    hidden_size = self.hidden_size, weight_attr=param_attr)
+            self.rel_pos_layer = RelPosLayer(rel_min=self.relative_position_min, 
+                    rel_max = self.relative_position_max, 
+                    emb_size = self.hidden_size, weight_attr=param_attr)
 
         # role embeddings
         self.use_role = args.use_role
