@@ -58,9 +58,13 @@ class RecFormer(Model):
         self.d_key = args.get("key_size", self.hidden_size // self.n_head)
         self.d_value = args.get("value_size", self.hidden_size // self.n_head)
         self.inner_hidden_size = args.get("inner_hidden_size", self.hidden_size * 4)
+        self.relative_position_min = args.relative_position_min
+        self.relative_position_max = args.relative_position_max
+        self.use_relative_position = args.use_relative_position
+
         self.memory_length = args.get("memory_length", 256)
         self.recursion_length = args.get("recursion_length", 128)
-        self.aux_loss_weight = args.get("auxiliary_loss_weight", 0.50)
+        self.aux_loss_weight = args.get("auxiliary_loss_weight", -1.0)
 
         # embeddings
         self.vocab_size = args.vocab_size
@@ -71,7 +75,15 @@ class RecFormer(Model):
             self.type_embedding = nn.Embedding(self.type_size, self.emb_size, weight_attr=param_attr)
 
         self.token_embedding = nn.Embedding(self.vocab_size, self.emb_size, weight_attr=param_attr)
-        self.pos_embedding = nn.Embedding(self.recursion_length, self.emb_size, weight_attr=param_attr)
+
+        # Use relative position layer or position embedding depending on use relative position or not
+        if(not self.use_relative_position):
+            self.pos_embedding = nn.Embedding(self.max_positions, self.emb_size, weight_attr=param_attr)
+            self.rel_pos_layer = None
+        else:
+            self.rel_pos_layer = RelPosLayer(rel_min=self.relative_position_min, 
+                    rel_max = self.relative_position_max, 
+                    emb_size = self.hidden_size, weight_attr=param_attr)
 
         # role embeddings
         self.use_role = args.use_role
@@ -86,23 +98,27 @@ class RecFormer(Model):
         if self.emb_mapping_in:
             self.emb_mapping_fc = nn.Linear(self.emb_size, self.hidden_size, weight_attr=param_attr)
 
-        # transformer encoder
+        # LTM encoder
         self.normalize_before = args.get("normalize_before", True)
         self.hidden_act = args.hidden_act
-        self.encoder_layer = RecFormerEncoderLayer(
-            self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
+        self.encoder = LongTermMemEncoder(
+            self.hidden_size, self.n_head, self.inner_hidden_size, rel_pos_layer=self.rel_pos_layer, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
-        self.encoder = RecFormerEncoder(self.encoder_layer, self.n_layer)
 
+        # Memory Augmented Decoder
         self.decoder_layer = MemAugDecoderDecoderLayer(
-            self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
+            self.hidden_size, self.n_head, self.inner_hidden_size, rel_pos_layer=self.rel_pos_layer, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
-        self.aux_decoder_layer = MemAugDecoderLayer(
-            self.hidden_size, self.n_head, self.inner_hidden_size, dropout=self.dropout, activation=self.hidden_act,
-            act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
-
         self.decoder = MemAugDecoder(self.decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
-        self.aux_decoder = MemAugDecoder(self.aux_decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
+
+        # Auxiliary Memory Decoder
+        if(self.aux_loss_weight > 0.0):
+            self.aux_decoder = MemAugDecoder(self.aux_decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
+            self.aux_decoder_layer = MemAugDecoderLayer(
+                self.hidden_size, self.n_head, self.inner_hidden_size, rel_pos_layer=self.rel_pos_layer, dropout=self.dropout, activation=self.hidden_act,
+                act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
+        else:
+            self.aux_decoder = None
 
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
@@ -136,12 +152,15 @@ class RecFormer(Model):
         Returns:
             A Tuple contains the input embeddings and the attention masking matrix of Transformer.
         """
+        batch_size = token_ids.shape[0]
         segment_length = token_ids.shape[1]
-        pos_ids = paddle.to_tensor([i % self.recursion_length for i in range(segment_length)])
+        emb_out = self.token_embedding(token_ids)
 
-        token_emb_out = self.token_embedding(token_ids)
-        pos_emb_out = self.pos_embedding(pos_ids)
-        emb_out = token_emb_out + pos_emb_out
+        if(not self.use_relative_position):
+            pos_ids = paddle.to_tensor([list(range(segment_length))] * batch_size)
+            pos_ids = paddle.clip(pos_ids, max=self.max_positions-1)
+            pos_emb_out = self.pos_embedding(pos_ids)
+            emb_out = emb_out + pos_emb_out
 
         if(self.type_embedding is not None):
             type_emb_out = self.type_embedding(type_ids)
@@ -181,7 +200,7 @@ class RecFormer(Model):
         if self._generation_caches is None:
             enc_out, aux_out =  self._encode(emb_input)
         else:
-            enc_out, self._generation_caches = self._encode(
+            enc_out, aux_out, self._generation_caches = self._encode(
                 emb_input, self._generation_caches)
         return enc_out, aux_out
 
@@ -222,28 +241,33 @@ class RecFormer(Model):
                 (rec_len, rec_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
 
             if(caches is not None):
-                output, _, caches = self.decoder(emb_input[:, _start:_end, :], self.memories, 
+                output, stms, caches = self.decoder(emb_input[:, _start:_end, :], self.memories, 
                         tgt_mask=mask, cache=caches)
             else:
-                output, _ = self.decoder(emb_input[:, _start:_end, :], self.memories, 
+                output, stms = self.decoder(emb_input[:, _start:_end, :], self.memories, 
                         tgt_mask=mask)
             outputs.append(output)
-            self.memories = self.encoder(emb_input[:, _start:_end, :], self.memories)
+            new_ltms = []
+            for ltm, stm in zip(self.memories, stms):
+                new_ltm = self.encoder(emb_input[:, _start:_end, :], self.memories)
+                new_ltms.append(ltm)
+            self.memories = new_ltms
             _start = _end
         outputs = paddle.concat(outputs, axis=1)
 
         # Auxiliary Decoder
-        if(caches is None):
+        if(self.aux_decoder is not None):
             mask = paddle.tensor.triu((paddle.ones(
-                (_stop, _stop), dtype=paddle.get_default_dtype()) * -np.inf), 1)
-            aux_outputs = self.aux_decoder(emb_input, self.memories, 
-                    tgt_mask=mask)
+                    (_stop, _stop), dtype=paddle.get_default_dtype()) * -np.inf), 1)
+            aux_outputs = self.aux_decoder(emb_input, self.memories, tgt_mask=mask)
 
         self.memories = [memory.detach() for memory in self.memories]
 
         # Re-concatenate all the results
-
-        return (outputs, aux_outputs) if caches is None else (output, caches)
+        if(self.aux_decoder is None):
+            return outputs, None, caches if caches is None else outputs, None
+        else:
+            return outputs, aux_outputs if caches is None else outputs, aux_outputs, caches
 
     def _calc_logits(self, enc_out, tgt_idx=None):
         """Get the logits of generation task.
@@ -299,19 +323,21 @@ class RecFormer(Model):
             raise Exception("Target Idx can not be used for recformer")
         else:
             tgt_logits = self._calc_logits(outputs["enc_out"])
-            aux_tgt_logits = self._calc_logits(outputs["aux_out"])
             tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"], reduction="none")
-            aux_lm_loss = F.cross_entropy(aux_tgt_logits, inputs["tgt_label"], reduction="none")
             metrics["sum_lm_loss"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
-            metrics["sum_aux_loss"] = paddle.sum(aux_lm_loss * inputs["loss_mask"])
             metrics["sum_lm_mask"] = paddle.sum(inputs["loss_mask"])
             mean_tgt_lm_loss = metrics["sum_lm_loss"] / (metrics["sum_lm_mask"] + 1e-8)
-            mean_aux_lm_loss = metrics["sum_aux_loss"] / (metrics["sum_lm_mask"] + 1e-8)
-        metrics["token_lm_loss"] = mean_tgt_lm_loss
-        metrics["token_aux_loss"] = mean_aux_lm_loss
+            if(outputs["aux_out"] is not None):
+                aux_tgt_logits = self._calc_logits(outputs["aux_out"])
+                aux_lm_loss = F.cross_entropy(aux_tgt_logits, inputs["tgt_label"], reduction="none")
+                metrics["sum_aux_loss"] = paddle.sum(aux_lm_loss * inputs["loss_mask"])
+                mean_aux_lm_loss = metrics["sum_aux_loss"] / (metrics["sum_lm_mask"] + 1e-8)
+                metrics["token_aux_loss"] = mean_aux_lm_loss
 
+        metrics["token_lm_loss"] = mean_tgt_lm_loss
         loss = mean_tgt_lm_loss + self.aux_loss_weight * mean_aux_lm_loss
         metrics["loss"] = loss
+
         return metrics
 
     def get_statistics(self, inputs, outputs):

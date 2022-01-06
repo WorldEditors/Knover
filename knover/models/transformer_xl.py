@@ -97,7 +97,6 @@ class TransformerXL(Model):
         # memories
         self.memories = None
 
-        # transformer encoder
         self.normalize_before = args.get("normalize_before", True)
         self.hidden_act = args.hidden_act
 
