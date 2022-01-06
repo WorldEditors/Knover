@@ -33,10 +33,10 @@ from knover.modules.rel_pos_attention import MultiHeadRelPosAttention
 __all__ = []
 
 
-class RecFormerEncoderLayer(Layer):
+class LongTermMemEncoder(Layer):
     """
-    RecFormer Encoder Layer
-    Takes the External Memory M_{t}^{L}, X_{t}^{L}, yield the External Memory in Next Step M_{t+1}^{L}, X_{t}^{L+1}
+    Long Term Memory Encoder
+    Takes an external long term memory LT, and short term memory ST, and produces the next long term memory LT
     """
 
     def __init__(self,
@@ -57,7 +57,7 @@ class RecFormerEncoderLayer(Layer):
         self._config.pop("self")
         self._config.pop("__class__", None)  # py3
 
-        super(RecFormerEncoderLayer, self).__init__()
+        super(LongTermMemEncoder, self).__init__()
 
         assert d_model > 0, ("Expected d_model to be greater than 0, "
                              "but recieved {}".format(d_model))
@@ -70,6 +70,7 @@ class RecFormerEncoderLayer(Layer):
         attn_dropout = dropout if attn_dropout is None else attn_dropout
         act_dropout = dropout if act_dropout is None else act_dropout
         self.normalize_before = normalize_before
+
         #maximum position id in a segment
         self.max_length = max_length
         self.k = k
@@ -105,29 +106,24 @@ class RecFormerEncoderLayer(Layer):
         self.dropout2 = Dropout(dropout, mode="upscale_in_train")
         self.activation = getattr(F, activation)
 
-    def forward(self, memory, src, is_last_layer=False):
+    def forward(self, ltm, stm):
         """
-        src: source to be encoded into the memory, should be tensor of size [Batch, SeqLen, Hidden]
-        memory: tensor of size [Batch, SegmentLen, Hidden]
-        is_last_layer: for the last layer we will not process the source token
+        stm: short term memory to be encoded into the long-term memory, should be a tensor of size [Batch, SeqLen, Hidden]
+        ltm: long term memory to be updated, should be a tensor of size [Batch, SeqLen, Hidden]
         """
-        l_m = memory.shape[1]
-        l_s = src.shape[1]
-        concat_src = paddle.concat(x=[memory, src], axis=1)
+        ltm_len = ltm[0].shape[1]
+        stm_len = stm[0].shape[1]
+        query = ltm
+        key = paddle.concat(x=[ltm, stm], axis=1)
 
-        if(not is_last_layer):
-            residual = concat_src
-        else:
-            residual = memory
+        residual = ltm
 
         if self.normalize_before:
-            concat_src = self.norm1(src)
-            normalized_mem = self.norm1(memory)
+            key = self.norm1(key)
+            query = self.norm1(ltm)
 
-        if(not is_last_layer):
-            output = self.self_attn(concat_src, concat_src, concat_src)
-        else:
-            output = self.self_attn(normalized_mem, concat_src, concat_src)
+        # If relative position is used, the relative start position of key is the same as the relative start position of query
+        output = self.self_attn(query, key, key)
 
         output = residual + self.dropout1(output)
         if not self.normalize_before:
@@ -143,40 +139,7 @@ class RecFormerEncoderLayer(Layer):
         if not self.normalize_before:
             output = self.norm2(output)
 
-        return paddle.split(output, [l_m, l_s], axis=1) if(not is_last_layer) else output
-
-class RecFormerEncoder(Layer):
-    """
-    Define Recursive Encoder
-    Takes the External Memory M_{t}, X_{t}, yield the External Memory in Next Step M_{t+1}
-    M_{t}: A length "NumLayer" list of Tensor of Size [BatchSize, SegmentLength, Hidden]
-    X_{t}: input of size [Batch, SeqLength, Hidden]
-    M_{t+1}: The same shaped memory as M_{t} containing the information of X_t and M_t
-    """
-
-    def __init__(self, encoder_layer, num_layers):
-        super(RecFormerEncoder, self).__init__()
-        self.layers = LayerList([(encoder_layer if i == 0 else
-                type(encoder_layer)(**encoder_layer._config))
-                for i in range(num_layers)])
-        self.num_layers = num_layers
-
-    def forward(self, memories, src):
-        """
-        src:  A tensor of shape [Batch, Sequence, Hidden]
-        memories:  A NumLayers list of tensor of shape [Batch, Sequence, Hidden]
-        """
-        assert(len(memories) == self.num_layers), "The memories have different layers"
-
-        new_memories = []
-        output = src
-        for i, mod in enumerate(self.layers[:-1]):
-            mem, output = mod(memories[i], output)
-            new_memories.append(mem)
-        mem = self.layers[-1](memories[self.num_layers-1], output, is_last_layer=True)
-        new_memories.append(mem)
-
-        return new_memories
+        return output
 
 class MemAugDecoderLayer(Layer):
     """

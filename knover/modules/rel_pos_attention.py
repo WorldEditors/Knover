@@ -67,41 +67,11 @@ class RelPosLayer(Layer):
 
 class MultiHeadRelPosAttention(Layer):
     """
-    Relative Position Attention Layer 
-
-    Parameters:
-        embed_dim (int): The expected feature size in the input and output.
-        num_heads (int): The number of heads in multi-head attention.
-        rel_pos_layer (optional): If None, no relative position is used, 
-            else, use relative position, must be type of (RelPosLayer)
-        dropout (float, optional): The dropout probability used on attention
-            weights to drop some attention targets. 0 for no dropout. Default 0
-        kdim (int, optional): The feature size in key. If None, assumed equal to
-            `embed_dim`. Default None.
-        vdim (int, optional): The feature size in value. If None, assumed equal to
-            `embed_dim`. Default None.
-        need_weights (bool, optional): Indicate whether to return the attention
-            weights. Default False.
-        weight_attr(ParamAttr, optional):  To specify the weight parameter property.
-            Default: None, which means the default weight parameter property is used.
-            See usage for details in :code:`ParamAttr` .
-        bias_attr (ParamAttr|bool, optional): To specify the bias parameter property.
-            Default: None, which means the default bias parameter property is used.
-            If it is set to False, this layer will not have trainable bias parameter.
-            See usage for details in :code:`ParamAttr` .
-         
-    Examples:
-
-        .. code-block:: python
-
-            import paddle
-
-            # encoder input: [batch_size, sequence_length, d_model]
-            query = paddle.rand((2, 4, 128))
-            # self attention mask: [batch_size, num_heads, query_len, query_len]
-            attn_mask = paddle.rand((2, 2, 4, 4))
-            multi_head_attn = paddle.nn.MultiHeadAttention(128, 2)
-            output = multi_head_attn(query, None, None, attn_mask=attn_mask)  # [2, 4, 128]
+    Relative Position Attention Layer (DeBerta Type Relative Positions) 
+    Relative Position Types:
+        1. "cc"
+        2. "pc"
+        3. "cp"
     """
 
     Cache = collections.namedtuple("Cache", ["k", "v"])
@@ -124,7 +94,6 @@ class MultiHeadRelPosAttention(Layer):
                                "but recieved {}".format(embed_dim))
         assert num_heads > 0, ("Expected num_heads to be greater than 0, "
                                "but recieved {}".format(num_heads))
-
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
@@ -137,7 +106,7 @@ class MultiHeadRelPosAttention(Layer):
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
 
         self.q_proj = Linear(
-            embed_dim, embed_dim, weight_attr, bias_attr=bias_attr)
+            embed_dim, 2 * embed_dim, weight_attr, bias_attr=bias_attr)
         self.k_proj = Linear(
             self.kdim, embed_dim, weight_attr, bias_attr=bias_attr)
         self.v_proj = Linear(
@@ -153,45 +122,13 @@ class MultiHeadRelPosAttention(Layer):
 
     def _prepare_qkv(self, query, key, value, cache=None):
         r"""
-        Prapares linear projected queries, keys and values for usage of subsequnt
-        multiple parallel attention. If `cache` is not None, using cached results
-        to reduce redundant calculations.
-
-        Parameters:
-            query (Tensor): The queries for multi-head attention. It is a
-                tensor with shape `[batch_size, query_length, embed_dim]`. The
-                data type should be float32 or float64.
-            key (Tensor): The keys for multi-head attention. It is
-                a tensor with shape `[batch_size, key_length, kdim]`. The
-                data type should be float32 or float64. If None, use `query` as
-                `key`.
-            value (Tensor): The values for multi-head attention. It
-                is a tensor with shape `[batch_size, value_length, vdim]`.
-                The data type should be float32 or float64. If None, use `query` as
-                `value`.
-            cache (MultiHeadAttention.Cache|MultiHeadAttention.StaticCache, optional):
-                It is a namedtuple with `k` and `v` as fields, and stores tensors
-                shaped `[batch_size, num_heads, length, embed_dim]` which are results
-                of linear projection, reshape and transpose calculations in
-                MultiHeadAttention. If is an instance of `Cache`, `k` and `v`
-                fields reserve intermediate results of previous positions, which
-                mostly used for decoder self attention. If it is an instance of
-                `StaticCache`, `key` and `value` args would be ignored, `k` and
-                `v` fields would be used as calculated results on `key` and
-                `value`, which mostly used for decoder-encoder cross attention.
-                It is only used for inference and should be None for training.
-                Default None.
-
-        Returns:
-            tuple: A tuple including linear projected keys and values. These two \
-                tensors have shapes `[batch_size, n_head, sequence_length, d_key]` \
-                and `[batch_size, n_head, sequence_length, d_value]` separately, \
-                and their data types are same as inputs.
-            the shapes of q_r, k_r are `[n_head, 2k, d_value]`
         """
         q = self.q_proj(query)
-        q = tensor.reshape(x=q, shape=[0, 0, self.num_heads, self.head_dim])
-        q = tensor.transpose(x=q, perm=[0, 2, 1, 3])
+        qw, qr = paddle.chunk(q, chunks=2, axis=-1)
+        qw = tensor.reshape(x=qw, shape=[0, 0, self.num_heads, self.head_dim])
+        qw = tensor.transpose(x=qw, perm=[0, 2, 1, 3])
+        qr = tensor.reshape(x=qr, shape=[0, 0, self.num_heads, self.head_dim])
+        qr = tensor.transpose(x=qr, perm=[0, 2, 1, 3])
         kr = self.kr_proj(self.rel_pos_layer.position_emb)
         kr = tensor.reshape(x=kr, shape=[0, -1, self.num_heads, self.head_dim])
         kr = tensor.transpose(x=kr, perm=[1, 2, 0, 3])
@@ -208,33 +145,9 @@ class MultiHeadRelPosAttention(Layer):
             v = tensor.concat([cache.v, v], axis=2)
             cache = self.Cache(k, v)
 
-        return (q, k, v, kr) if cache is None else (q, k, v, kr, cache)
+        return (qw, qr, k, v, kr) if cache is None else (qw, qr, k, v, kr, cache)
 
     def compute_kv(self, key, value):
-        r"""
-        Applies linear projection on input keys and values, then splits heads
-        (reshape and transpose) to get keys and values from different representation
-        subspaces. The results are used as key-values pairs for subsequent multiple
-        parallel attention.
-        
-        It is part of calculations in multi-head attention, and is provided as
-        a method to pre-compute and prefetch these results, thus we can use them
-        to construct cache for inference.
-
-        Parameters:
-            key (Tensor): The keys for multi-head attention. It is a tensor
-                with shape `[batch_size, sequence_length, kdim]`. The data type
-                should be float32 or float64.
-            value (Tensor): The values for multi-head attention. It is a tensor
-                with shape `[batch_size, sequence_length, vdim]`. The data type
-                should be float32 or float64.
-
-        Returns:
-            tuple: A tuple including transformed keys and values. Their shapes \
-                both are `[batch_size, num_heads, sequence_length, embed_dim // num_heads]`, \
-                and their data types are same as inputs.
-            shape of kr is `[num_heads, 2k, embed_dim // num_heads]`
-        """
         k = self.k_proj(key)
         v = self.v_proj(value)
         k = tensor.reshape(x=k, shape=[0, 0, self.num_heads, self.head_dim])
@@ -244,54 +157,6 @@ class MultiHeadRelPosAttention(Layer):
         return k, v
 
     def gen_cache(self, key, value=None, type=Cache):
-        """
-        Generates cache for `forward` usage in inference accroding to arguments.
-        The generated cache is an instance of `MultiHeadAttention.Cache` or an
-        instance of `MultiHeadAttention.StaticCache`.
-
-        `Cache` or `StaticCache` is namedtuple with `k` and `v` as fields,
-        and it stores tensors shaped `[batch_size, num_heads, length, embed_dim]`
-        which are results of linear projection, reshape and transpose calculations
-        in MultiHeadAttention.
-        
-        If the generated cache is an instance of `Cache`, `k` and `v` fields
-        reserve intermediate result tensors of previous positions, and the tensors
-        are incremental among decoding steps, which mostly are used for decoder
-        decoder self attention.
-        
-        If the generated cache is an instance of `StaticCache`, `k` and `v` fields
-        would be used as calculated result tensors on keys an values in `forward`,
-        and the tensors keep unchanged among decoding steps, which are mostly used
-        for decoder-encoder cross attention.
-
-        The cache is generated as follows:
-
-        1. If `type` is `StaticCache`, apply `compute_kv(key, value)` and use the
-        results to create an instance of `StaticCache`.
-        
-        2. If `type` is `Cache` and `value` is None, generate empty tensors shaped
-        `[batch_size, num_heads, 0, embed_dim // num_heads]` and use the results
-        to create an instance of `Cache`, where `batch_size` is from the first
-        dimension of `key`.
-
-        3. If `type` is `Cache` and `value` is not None, use `key`, `value` to create
-        an instance of `Cache`.
-
-        Parameters:
-            key (Tensor): The keys for multi-head attention. It is
-                a tensor with shape `[batch_size, key_length, kdim]`. The
-                data type should be float32 or float64. If `value` is None,
-                it is only for batch size and data type reference.
-            value (Tensor, optional): The values for multi-head attention. It
-                is a tensor with shape `[batch_size, value_length, vdim]`.
-                The data type should be float32 or float64. If None, `key` is only
-                for batch size reference. Default None.
-            type (type): It should be `MultiHeadAttention.StaticCache` or
-                `MultiHeadAttention.Cache` to indicate the cache type to generate.
-        
-        Returns:
-            namedtuple: an instance of `Cache` or `StaticCache` accordingly.
-        """
         if type == MultiHeadAttention.StaticCache:  # static_kv
             k, v = self.compute_kv(key, value)
             return self.StaticCache(k, v)
@@ -312,58 +177,10 @@ class MultiHeadRelPosAttention(Layer):
             return self.Cache(key, value)
 
     def forward(self, query, key=None, value=None, rel_pos_start_key=0, attn_mask=None, cache=None):
-        r"""
-        Applies multi-head attention to map queries and a set of key-value pairs
-        to outputs.
-
-        Parameters:
-            query (Tensor): The queries for multi-head attention. It is a
-                tensor with shape `[batch_size, query_length, embed_dim]`. The
-                data type should be float32 or float64.
-            key (Tensor, optional): The keys for multi-head attention. It is
-                a tensor with shape `[batch_size, key_length, kdim]`. The
-                data type should be float32 or float64. If None, use `query` as
-                `key`. Default None.
-            value (Tensor, optional): The values for multi-head attention. It
-                is a tensor with shape `[batch_size, value_length, vdim]`.
-                The data type should be float32 or float64. If None, use `query` as
-                `value`. Default None.
-            key_pos_start_idx (int, optional): The relative start position of key relative to
-                the start position of the query, 0 in default
-            attn_mask (Tensor, optional): A tensor used in multi-head attention
-                to prevents attention to some unwanted positions, usually the
-                paddings or the subsequent positions. It is a tensor with shape
-                broadcasted to `[batch_size, n_head, sequence_length, sequence_length]`.
-                When the data type is bool, the unwanted positions have `False` 
-                values and the others have `True` values. When the data type is 
-                int, the unwanted positions have 0 values and the others have 1 
-                values. When the data type is float, the unwanted positions have 
-                `-INF` values and the others have 0 values. It can be None when 
-                nothing wanted or needed to be prevented attention to. Default None.
-            cache (MultiHeadAttention.Cache|MultiHeadAttention.StaticCache, optional):
-                It is a namedtuple with `k` and `v` as fields, and stores tensors
-                shaped `[batch_size, num_heads, length, embed_dim]` which are results
-                of linear projection, reshape and transpose calculations in
-                MultiHeadAttention. If it is an instance of `Cache`, `k` and `v`
-                fields reserve intermediate results of previous positions, which
-                mostly used for decoder self attention. If it is an instance of
-                `StaticCache`, `key` and `value` args would be ignored, `k` and
-                `v` fields would be used as calculated results on `key` and
-                `value`, which mostly used for decoder-encoder cross attention.
-                It is only used for inference and should be None for training.
-                Default None.
-
-        Returns:
-            Tensor|tuple: It is a tensor that has the same shape and data type \
-                as `query`, representing attention output. Or a tuple if \
-                `need_weights` is True or `cache` is not None. If `need_weights` \
-                is True, except for attention output, the tuple also includes \
-                the attention weights tensor shaped `[batch_size, num_heads, query_length, key_length]`. \
-                If `cache` is not None, the tuple then includes the new cache \
-                having the same type as `cache`, and if it is `StaticCache`, it \
-                is same as the input `cache`, if it is `Cache`, the new cache \
-                reserves tensors concatanating raw tensors with intermediate \
-                results of current query.
+        """
+        rel_pos_start_key:  the relative position of the start position of key with respect to the start of query
+                e.g.,  for query = key, rel_pos_start_key = 0
+                       for transformer xl, query preceeds key, rel_pos_start_key = - memory_length
         """
         key = query if key is None else key
         value = query if value is None else value
@@ -389,19 +206,19 @@ class MultiHeadRelPosAttention(Layer):
 
         # compute q ,k ,v
         if cache is None:
-            q, k, v, kr = self._prepare_qkv(query, key, value, cache)
+            qw, qr, k, v, kr = self._prepare_qkv(query, key, value, cache)
         else:
-            q, k, v, kr, cache = self._prepare_qkv(query, key, value, cache)
+            qw, qr, k, v, kr, cache = self._prepare_qkv(query, key, value, cache)
 
         alpha = self.head_dim**-0.5
         # scale dot product attention
         # TODO(guosheng): use tensor.matmul, however it doesn't support `alpha`
         # prod_cc: `[batch_size, num_heads, q_seq_length, k_seq_length]`
-        prod_cc = alpha * paddle.matmul(x=q, y=k, transpose_y=True)
+        prod_cc = alpha * paddle.matmul(x=qw, y=k, transpose_y=True)
         # prod_cp
         # multiply `[batch_size, num_heads, q_seq_length, d_head]` and `[num_heads, nk, d_head]`
         # acquiring `[batch_size, num_heads, q_seq_length, max_pos_emb]`
-        prod_cp = alpha * paddle.matmul(x=q, y=kr, transpose_y=True)
+        prod_cp = alpha * paddle.matmul(x=qr, y=kr, transpose_y=True)
 
         # acquiring `[batch_size, num_heads, q_seq_length, max_pos_span]` 10, 30
         # by adding / slicing the rows out of range
