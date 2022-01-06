@@ -464,10 +464,10 @@ class ModelInterface(object):
         """
         with paddle.no_grad():
             if self.is_distributed:
-                self.dp_model.eval()
+                #self.dp_model.eval()
                 predictions = self.dp_model(inputs, mode="infer")
             else:
-                self.model.eval()
+                #self.model.eval()
                 predictions = self.model(inputs, mode="infer")
             return self._get_outputs(predictions)
 
