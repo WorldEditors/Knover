@@ -71,10 +71,6 @@ class LongTermMemEncoder(Layer):
         act_dropout = dropout if act_dropout is None else act_dropout
         self.normalize_before = normalize_before
 
-        #maximum position id in a segment
-        self.max_length = max_length
-        self.k = k
-
         weight_attrs = _convert_param_attr_to_list(weight_attr, 2)
         bias_attrs = _convert_param_attr_to_list(bias_attr, 2)
 
@@ -111,8 +107,8 @@ class LongTermMemEncoder(Layer):
         stm: short term memory to be encoded into the long-term memory, should be a tensor of size [Batch, SeqLen, Hidden]
         ltm: long term memory to be updated, should be a tensor of size [Batch, SeqLen, Hidden]
         """
-        ltm_len = ltm[0].shape[1]
-        stm_len = stm[0].shape[1]
+        ltm_len = ltm.shape[1]
+        stm_len = stm.shape[1]
         query = ltm
         key = paddle.concat(x=[ltm, stm], axis=1)
 

@@ -107,15 +107,6 @@ def train(args):
     task = tasks.create_task(args)
     model = models.create_model(args, place)
 
-    # setup datasets
-    train_generator = task.get_data_loader(
-        model,
-        input_file=args.train_file,
-        num_epochs=args.num_epochs,
-        num_part=trainers_num,
-        part_id=trainer_id,
-        phase="train"
-    )
     valid_tags = []
     valid_generators = []
     for valid_file in args.valid_file.split(","):
@@ -132,83 +123,10 @@ def train(args):
             phase="distributed_valid" if args.is_distributed else "valid"
         ))
 
-    # setup VDL and expt
-    global use_vdl, writer
-    use_vdl = args.use_vdl and trainer_id == 0
-    if use_vdl:
-        if args.on_k8s:
-            import expt
-            expt.init(name=os.getenv("EXPT_NAME", "DEBUG"))
-            expt.set_params(args.Model)
-            writer = expt
-        else:
-            from visualdl import LogWriter
-            writer = LogWriter(logdir=args.vdl_log_path)
-            print("vdl_logs", args.vdl_log_path)
-
-    # maintain best metric (init)
-    best_metric = -1e10
-    if args.eval_metric.startswith("-"):
-        scale = -1.0
-        eval_metric = args.eval_metric[1:]
-    else:
-        scale = 1.0
-        eval_metric = args.eval_metric
-    need_save = trainer_id == 0
-
-    # start training
-    timer = Timer()
-    timer.start()
-    print("Training is start.")
-    for step, data in enumerate(train_generator(), args.start_step + 1):
-        outputs = task.train_step(model, data)
-        timer.pause()
-
-        if step % args.log_steps == 0:
-            time_cost = timer.pass_time
-            current_epoch, current_file_index, total_file = task.reader.get_train_progress()
-            current_lr = outputs.pop('scheduled_lr')
-            print(f"[train][{current_epoch}] progress: {current_file_index}/{total_file} "
-                  f"step: {step}, time: {time_cost:.3f}, "
-                  f"queue size: {train_generator.queue.size()}, "
-                  f"speed: {args.log_steps / time_cost:.3f} steps/s")
-            print(f"\tcurrent lr: {current_lr:.7f}")
-            metrics = task.get_metrics(outputs)
-            print("\t" + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
-
-            if use_vdl:
-                if "loss_scaling" in metrics:
-                    loss_scaling = metrics.pop("loss_scaling")
-                    writer.add_scalar("optimize/loss_scaling", loss_scaling, step)
-                writer.add_scalar("optimize/lr", current_lr, step)
-                for name, value in metrics.items():
-                    writer.add_scalar(f"train/{name}", value, step)
-
-            timer.reset()
-
-        if(("require_validation" in outputs) or (step % args.validation_steps == 0)):
-            del outputs["require_validation"]
-            for valid_tag, valid_generator in zip(valid_tags, valid_generators):
-                eval_metrics = evaluate(task, model, valid_generator, args, dev_count, gpu_id, step, tag=valid_tag)
-                if valid_tag == "valid":
-                    valid_metrics = eval_metrics
-
-            # save latest model
-            if args.save_steps <= 0 and need_save:
-                save_model(model, args.save_path, "latest", dev_count, gpu_id, args)
-            # maintain best metric (update)
-            if valid_metrics[eval_metric] * scale > best_metric:
-                best_metric = valid_metrics[eval_metric] * scale
-                print(f"Get better valid metric: {eval_metric} = {valid_metrics[eval_metric]}")
-                # save best model (with best evaluation metric)
-                if need_save:
-                    save_model(model, args.save_path, "best", dev_count, gpu_id, args)
-
-        if args.save_steps > 0 and step % args.save_steps == 0 and need_save:
-            save_model(model, args.save_path, f"step_{step}", dev_count, gpu_id, args)
-
-        timer.start()
-    print("Training is completed.")
+    for valid_tag, valid_generator in zip(valid_tags, valid_generators):
+        eval_metrics = evaluate(task, model, valid_generator, args, dev_count, gpu_id, 0, tag=valid_tag)
+        if valid_tag == "valid":
+            valid_metrics = eval_metrics
 
     return
 

@@ -57,7 +57,7 @@ class MemAugGeneration(DialogGeneration):
         inputs = dict(zip(model.model.feed_names, inputs))
         
         model.model.reset_memories(inputs["batch_size"])
-        fin_outputs = {"token_lm_loss": 0.0, "token_aux_loss": 0.0, "loss": 0.0, "ready_for_validation": False}
+        outputs = {"valid_sum_logp": 0.0, "valid_tokens":0.0, "loss":0.0}
         seg_num = inputs["seg_num"]
         sum_lm_mask = 0.0
 
@@ -65,26 +65,31 @@ class MemAugGeneration(DialogGeneration):
             #avoiding large memories, do some detach
             seg_len = inputs["segment_lengths"][i]
             seg_input = {k:inputs[k][i, :, :seg_len] for k in self.train_keys}
-            outputs = model.train_step(seg_input)
+            tmp_outputs = model.train_step(seg_input)
             self.step += 1
 
-            fin_outputs["token_lm_loss"] += outputs["sum_lm_loss"]
-            fin_outputs["token_aux_loss"] += outputs["sum_aux_loss"]
-            fin_outputs["loss"] += outputs["loss"] * outputs["sum_lm_mask"]
-            sum_lm_mask += outputs["sum_lm_mask"]
+            outputs["valid_sum_logp"] += tmp_outputs["valid_sum_logp"]
+            if("valid_sum_aux_logp" in tmp_outputs):
+                if("valid_sum_aux_logp" in outputs):
+                    outputs["valid_sum_aux_logp"] += tmp_outputs["valid_sum_aux_logp"]
+                else:
+                    outputs["valid_sum_aux_logp"] = tmp_outputs["valid_sum_aux_logp"]
+            outputs["loss"] += tmp_outputs["loss"]
+            outputs["valid_tokens"] += tmp_outputs["valid_tokens"]
+
             if(self.step >= self.validation_step):
                 self.step = 0
-                fin_outputs["ready_for_validation"] = True
+                outputs["require_validation"] = True
                 break
-            #print("training loss", outputs["token_lm_loss"],  outputs["token_aux_loss"])
 
-        fin_outputs["token_lm_loss"] /= sum_lm_mask
-        fin_outputs["token_aux_loss"] /= sum_lm_mask
-        fin_outputs["loss"] /= sum_lm_mask
-        fin_outputs["scheduled_lr"] = outputs["scheduled_lr"]
+        outputs["scheduled_lr"] = tmp_outputs["scheduled_lr"]
+        outputs["token_average_ppl"] = outputs["valid_sum_logp"] / outputs["valid_tokens"]
+        if("valid_sum_aux_logp" in outputs):
+            outputs["auxiliary_token_average_ppl"] = outputs["valid_sum_aux_logp"] / outputs["valid_tokens"]
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
-                   for k, v in fin_outputs.items()}
+                   for k, v in outputs.items()}
+
         return outputs
 
     def eval_step(self, model: ModelInterface, inputs):
@@ -92,7 +97,7 @@ class MemAugGeneration(DialogGeneration):
         inputs = dict(zip(model.model.feed_names, inputs))
 
         model.model.reset_memories(inputs["batch_size"])
-        fin_outputs = {"token_lm_loss": 0.0, "token_aux_loss": 0.0, "loss": 0.0}
+        outputs = {"valid_sum_logp": 0.0, "valid_tokens":0.0, "loss":0.0}
         seg_num = inputs["seg_num"]
         sum_lm_mask = 0.0
 
@@ -100,22 +105,25 @@ class MemAugGeneration(DialogGeneration):
             #avoiding large memories, do some detach
             seg_len = inputs["segment_lengths"][i]
             seg_input = {k:inputs[k][i, :, :seg_len] for k in self.train_keys}
-            outputs = model.eval_step(seg_input)
+            tmp_outputs = model.eval_step(seg_input)
 
-            fin_outputs["token_lm_loss"] += outputs["sum_lm_loss"]
-            fin_outputs["token_aux_loss"] += outputs["sum_aux_loss"]
-            fin_outputs["loss"] += outputs["loss"] * outputs["sum_lm_mask"]
-            sum_lm_mask += outputs["sum_lm_mask"]
-            #print("eval loss", outputs["token_lm_loss"],  outputs["token_aux_loss"])
+            outputs["valid_sum_logp"] += tmp_outputs["valid_sum_logp"]
+            if("valid_sum_aux_logp" in tmp_outputs):
+                if("valid_sum_aux_logp" in outputs):
+                    outputs["valid_sum_aux_logp"] += tmp_outputs["valid_sum_aux_logp"]
+                else:
+                    outputs["valid_sum_aux_logp"] = tmp_outputs["valid_sum_aux_logp"]
+            outputs["valid_tokens"] += tmp_outputs["valid_tokens"]
+            outputs["loss"] += tmp_outputs["loss"]
 
-        fin_outputs["token_lm_loss"] /= sum_lm_mask
-        fin_outputs["token_aux_loss"] /= sum_lm_mask
-        fin_outputs["loss"] /= sum_lm_mask
-        fin_outputs["batch_size"] = outputs["batch_size"]
-        fin_outputs["tokens_num"] = outputs["tokens_num"]
+        outputs["batch_size"] = tmp_outputs["batch_size"]
+        outputs["tokens_num"] = tmp_outputs["tokens_num"]
+        outputs["token_average_ppl"] = outputs["valid_sum_logp"] / outputs["valid_tokens"]
+        if("valid_sum_aux_logp" in outputs):
+            outputs["auxiliary_token_average_ppl"] = outputs["valid_sum_aux_logp"] / outputs["valid_tokens"]
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
-                   for k, v in fin_outputs.items()}
+                   for k, v in outputs.items()}
         return outputs
 
     def infer_step(self, model: ModelInterface, inputs):

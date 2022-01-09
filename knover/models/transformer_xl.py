@@ -61,6 +61,7 @@ class TransformerXL(Model):
         self.d_key = args.get("key_size", self.hidden_size // self.n_head)
         self.d_value = args.get("value_size", self.hidden_size // self.n_head)
         self.inner_hidden_size = args.get("inner_hidden_size", self.hidden_size * 4)
+        self.memory_length = args.get("memory_length", 256)
 
         # embeddings
         self.vocab_size = args.vocab_size
@@ -233,9 +234,12 @@ class TransformerXL(Model):
             (l_s, l_s), dtype=paddle.get_default_dtype()) * -1.0e+10), 1)
 
         if(caches is not None):
-            self.memories, output, caches = self.decoder(self.memories, emb_input, mask, cache=caches)
+            hids, output, caches = self.decoder(self.memories, emb_input, mask, cache=caches)
         else:
-            self.memories, output = self.decoder(self.memories, emb_input, mask)
+            hids, output = self.decoder(self.memories, emb_input, mask)
+
+        # Update Short Term Memory
+        self.update_memories(hids)
 
         # Re-concatenate all the results
 
@@ -296,14 +300,10 @@ class TransformerXL(Model):
         else:
             tgt_logits = self._calc_logits(outputs["enc_out"])
             tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"], reduction="none")
-            metrics["sum_lm_loss"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
-            metrics["sum_aux_loss"] = 0.0
-            metrics["sum_lm_mask"] = paddle.sum(inputs["loss_mask"])
-            mean_tgt_lm_loss = metrics["sum_lm_loss"] / (metrics["sum_lm_mask"] + 1e-8)
-        metrics["token_lm_loss"] = mean_tgt_lm_loss
+            metrics["valid_sum_logp"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
+            metrics["valid_tokens"] = paddle.sum(inputs["loss_mask"])
+            metrics["loss"] = metrics["valid_sum_logp"] / (metrics["valid_tokens"] + 1e-8)
 
-        loss = mean_tgt_lm_loss
-        metrics["loss"] = loss
         return metrics
 
     def get_statistics(self, inputs, outputs):
@@ -322,4 +322,17 @@ class TransformerXL(Model):
         raise NotImplementedError
 
     def reset_memories(self, batch_size):
-        self.memories = None
+        self.memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * self.n_layer
+
+    def update_memories(self, hids):
+        new_memories = []
+        mem_len = self.memories[0].shape[1]
+        hid_len = hids[0].shape[1]
+        max_len = mem_len + hid_len
+        for i, hid in enumerate(hids):
+            if(hid_len <= mem_len):
+                new_hid = paddle.concat([self.memories[i], hid], axis=1)
+            else:
+                new_hid = hid
+            new_memories.append(paddle.slice(new_hid, axes=[1], starts=[-mem_len], ends=[max_len]))
+        self.memories = new_memories

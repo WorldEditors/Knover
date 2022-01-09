@@ -18,11 +18,11 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 
-from paddle.nn import TransformerDecoderLayer
+from knover.modules.rel_pos_attention import RelPosLayer
+from knover.modules.recformer_block import LongTermMemEncoder, MemAugDecoderLayer, MemAugDecoder
 from knover.models import register_model
 from knover.core.model import Model
 from knover.modules.generator import Generator
-from knover.modules.recformer_block import RecFormerEncoder, RecFormerEncoderLayer, MemAugDecoder, MemAugDecoderLayer
 from knover.utils import gather, str2bool
 
 
@@ -106,17 +106,17 @@ class RecFormer(Model):
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
 
         # Memory Augmented Decoder
-        self.decoder_layer = MemAugDecoderDecoderLayer(
+        self.decoder_layer = MemAugDecoderLayer(
             self.hidden_size, self.n_head, self.inner_hidden_size, rel_pos_layer=self.rel_pos_layer, dropout=self.dropout, activation=self.hidden_act,
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
         self.decoder = MemAugDecoder(self.decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
 
         # Auxiliary Memory Decoder
         if(self.aux_loss_weight > 0.0):
-            self.aux_decoder = MemAugDecoder(self.aux_decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
             self.aux_decoder_layer = MemAugDecoderLayer(
                 self.hidden_size, self.n_head, self.inner_hidden_size, rel_pos_layer=self.rel_pos_layer, dropout=self.dropout, activation=self.hidden_act,
                 act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
+            self.aux_decoder = MemAugDecoder(self.aux_decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
         else:
             self.aux_decoder = None
 
@@ -196,9 +196,9 @@ class RecFormer(Model):
         """
         emb_input = self._gen_input(
             token_ids, type_ids, role_ids, aux_emb=aux_emb)
-        aux_out = None
         if self._generation_caches is None:
-            enc_out, aux_out =  self._encode(emb_input)
+            res = self._encode(emb_input)
+            enc_out, aux_out = res#self._encode(emb_input)
         else:
             enc_out, aux_out, self._generation_caches = self._encode(
                 emb_input, self._generation_caches)
@@ -241,17 +241,16 @@ class RecFormer(Model):
                 (rec_len, rec_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
 
             if(caches is not None):
-                output, stms, caches = self.decoder(emb_input[:, _start:_end, :], self.memories, 
+                stms, output, caches = self.decoder(self.memories, emb_input[:, _start:_end, :],
                         tgt_mask=mask, cache=caches)
             else:
-                output, stms = self.decoder(emb_input[:, _start:_end, :], self.memories, 
+                stms, output = self.decoder(self.memories, emb_input[:, _start:_end, :],
                         tgt_mask=mask)
             outputs.append(output)
-            new_ltms = []
-            for ltm, stm in zip(self.memories, stms):
-                new_ltm = self.encoder(emb_input[:, _start:_end, :], self.memories)
-                new_ltms.append(ltm)
-            self.memories = new_ltms
+
+            # Update Long Term Memory
+            self.update_memories(stms)
+
             _start = _end
         outputs = paddle.concat(outputs, axis=1)
 
@@ -259,15 +258,21 @@ class RecFormer(Model):
         if(self.aux_decoder is not None):
             mask = paddle.tensor.triu((paddle.ones(
                     (_stop, _stop), dtype=paddle.get_default_dtype()) * -np.inf), 1)
-            aux_outputs = self.aux_decoder(emb_input, self.memories, tgt_mask=mask)
+            stms, aux_outputs = self.aux_decoder(self.memories, emb_input, tgt_mask=mask)
 
         self.memories = [memory.detach() for memory in self.memories]
 
-        # Re-concatenate all the results
+        # Return outputs
         if(self.aux_decoder is None):
-            return outputs, None, caches if caches is None else outputs, None
+            if caches is None:
+                return outputs, None
+            else:
+                return outputs, None, caches
         else:
-            return outputs, aux_outputs if caches is None else outputs, aux_outputs, caches
+            if caches is None:
+                return outputs, aux_outputs
+            else:
+                return outputs, aux_outputs, caches
 
     def _calc_logits(self, enc_out, tgt_idx=None):
         """Get the logits of generation task.
@@ -324,19 +329,13 @@ class RecFormer(Model):
         else:
             tgt_logits = self._calc_logits(outputs["enc_out"])
             tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"], reduction="none")
-            metrics["sum_lm_loss"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
-            metrics["sum_lm_mask"] = paddle.sum(inputs["loss_mask"])
-            mean_tgt_lm_loss = metrics["sum_lm_loss"] / (metrics["sum_lm_mask"] + 1e-8)
+            metrics["valid_sum_logp"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
+            metrics["valid_tokens"] = paddle.sum(inputs["loss_mask"])
             if(outputs["aux_out"] is not None):
                 aux_tgt_logits = self._calc_logits(outputs["aux_out"])
                 aux_lm_loss = F.cross_entropy(aux_tgt_logits, inputs["tgt_label"], reduction="none")
-                metrics["sum_aux_loss"] = paddle.sum(aux_lm_loss * inputs["loss_mask"])
-                mean_aux_lm_loss = metrics["sum_aux_loss"] / (metrics["sum_lm_mask"] + 1e-8)
-                metrics["token_aux_loss"] = mean_aux_lm_loss
-
-        metrics["token_lm_loss"] = mean_tgt_lm_loss
-        loss = mean_tgt_lm_loss + self.aux_loss_weight * mean_aux_lm_loss
-        metrics["loss"] = loss
+                metrics["valid_sum_aux_logp"] = paddle.sum(aux_lm_loss * inputs["loss_mask"])
+        metrics["loss"] = (metrics["valid_sum_logp"] + self.aux_loss_weight * metrics["valid_sum_aux_logp"]) / (metrics["valid_tokens"] + 1e-8)
 
         return metrics
 
@@ -353,32 +352,13 @@ class RecFormer(Model):
 
         Only support generation now.
         """
-        if self.do_generation:
-            outputs = self.generator(self, inputs, outputs)
-            data_id_list = outputs["data_id"].numpy()
-            token_ids_list = outputs["token_ids"].numpy()
-            seq_ids_list = outputs["finished_ids"].numpy()
-            score_list = outputs["finished_score"].numpy()
-            predictions = []
-            for data_id, token_ids, seq_ids, score in zip(data_id_list, token_ids_list, seq_ids_list, score_list):
-                if len(seq_ids.shape) == 1:
-                    pred = {}
-                    pred["data_id"] = int(data_id)
-                    pred["decode_score"] = float(score)
-                    pred["context_token_ids"] = token_ids
-                    pred["response_token_ids"] = seq_ids
-                    predictions.append(pred)
-                else:
-                    for candidate_seq_ids, candidate_score in zip(seq_ids, score):
-                        pred = {}
-                        pred["data_id"] = int(data_id)
-                        pred["decode_score"] = float(candidate_score)
-                        pred["context_token_ids"] = token_ids
-                        pred["response_token_ids"] = candidate_seq_ids
-                        predictions.append(pred)
-            return predictions
-        else:
-            raise NotImplementedError
+        raise NotImplementedError
 
     def reset_memories(self, batch_size):
         self.memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * self.n_layer
+
+    def update_memories(self, hids):
+        new_memories = []
+        for i, hid in enumerate(hids):
+            new_memories.append(self.encoder(self.memories[i], hid))
+        self.memories = new_memories
