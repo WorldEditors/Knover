@@ -328,8 +328,10 @@ if __name__ == "__main__":
         train(args)
     except:
         if use_vdl and args.on_k8s:
+            import expt
             expt.fail()
         raise
     else:
         if use_vdl and args.on_k8s:
+            import expt
             expt.success()

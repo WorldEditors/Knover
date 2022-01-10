@@ -335,7 +335,10 @@ class RecFormer(Model):
                 aux_tgt_logits = self._calc_logits(outputs["aux_out"])
                 aux_lm_loss = F.cross_entropy(aux_tgt_logits, inputs["tgt_label"], reduction="none")
                 metrics["valid_sum_aux_logp"] = paddle.sum(aux_lm_loss * inputs["loss_mask"])
-        metrics["loss"] = (metrics["valid_sum_logp"] + self.aux_loss_weight * metrics["valid_sum_aux_logp"]) / (metrics["valid_tokens"] + 1e-8)
+                metrics["loss"] = (metrics["valid_sum_logp"] + self.aux_loss_weight * metrics["valid_sum_aux_logp"]) / (metrics["valid_tokens"] + 1e-8)
+            else:
+                metrics["loss"] = metrics["valid_sum_logp"] / (metrics["valid_tokens"] + 1e-8)
+
 
         return metrics
 
