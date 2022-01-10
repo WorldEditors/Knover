@@ -294,12 +294,11 @@ def evaluate(task,
                 outputs = json.load(fp)
             run_cmd(f"rm {part_file}*")
 
+    metrics = task.get_metrics(outputs)
     print(f"[Evaluation][{training_step}] " + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
-
     if use_vdl:
         for name, value in metrics.items():
             writer.add_scalar(f"{tag}/{name}", value, training_step)
-
     print(f"\ttime cost: {timer.pass_time:.3f}")
     print("=" * 80)
     return metrics
