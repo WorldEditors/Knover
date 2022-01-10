@@ -235,21 +235,21 @@ class RecFormer(Model):
 
         # Output size [Batch, SegLen, HiddenDim]
         while _start < _stop:
+            # Update Long Term Memory
             rec_len = min(_stop - _start, self.recursion_length)
             _end = _start + rec_len
             mask = paddle.tensor.triu((paddle.ones(
                 (rec_len, rec_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
 
+            self.update_memories(self.st_memories)
             if(caches is not None):
-                stms, output, caches = self.decoder(self.memories, emb_input[:, _start:_end, :],
+                self.st_memories, output, caches = self.decoder(self.memories, emb_input[:, _start:_end, :],
                         tgt_mask=mask, cache=caches)
             else:
-                stms, output = self.decoder(self.memories, emb_input[:, _start:_end, :],
+                self.st_memories, output = self.decoder(self.memories, emb_input[:, _start:_end, :],
                         tgt_mask=mask)
             outputs.append(output)
 
-            # Update Long Term Memory
-            self.update_memories(stms)
 
             _start = _end
         outputs = paddle.concat(outputs, axis=1)
@@ -359,9 +359,11 @@ class RecFormer(Model):
 
     def reset_memories(self, batch_size):
         self.memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * self.n_layer
+        self.st_memories = None
 
     def update_memories(self, hids):
-        new_memories = []
-        for i, hid in enumerate(hids):
-            new_memories.append(self.encoder(self.memories[i], hid))
-        self.memories = new_memories
+        if(hids is not None):
+            new_memories = []
+            for i, hid in enumerate(hids):
+                new_memories.append(self.encoder(self.memories[i], hid.detach()))
+            self.memories = new_memories
