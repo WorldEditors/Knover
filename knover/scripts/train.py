@@ -294,7 +294,6 @@ def evaluate(task,
                 outputs = json.load(fp)
             run_cmd(f"rm {part_file}*")
 
-    metrics = task.get_metrics(outputs)
     print(f"[Evaluation][{training_step}] " + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
 
     if use_vdl:

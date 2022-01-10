@@ -34,6 +34,7 @@ class MemAugGeneration(DialogGeneration):
         super(MemAugGeneration, self).__init__(args)
         self.reader = LongTextReader(args)
         self.validation_step = args.validation_step
+        self.validation_words = args.validation_words
         self.step = 0
         if(self.reader.use_role):
             self.train_keys = ["token_ids", "type_ids", "role_ids", "tgt_label", "loss_mask"]
@@ -50,6 +51,8 @@ class MemAugGeneration(DialogGeneration):
                 help="length of each segments")
         group.add_argument("--validation_step", type=int, default=1000,
                 help="use inner validation steps")
+        group.add_argument("--validation_words", type=int, default=-1,
+                help="used for calculate ppl_per_word")
         DialogGeneration.add_cmdline_args(parser)
 
     def train_step(self, model: ModelInterface, inputs):
@@ -74,7 +77,7 @@ class MemAugGeneration(DialogGeneration):
                     outputs["valid_sum_aux_logp"] += tmp_outputs["valid_sum_aux_logp"]
                 else:
                     outputs["valid_sum_aux_logp"] = tmp_outputs["valid_sum_aux_logp"]
-            outputs["loss"] += tmp_outputs["loss"]
+            outputs["loss"] += tmp_outputs["loss"] * tmp_outputs["valid_tokens"]
             outputs["valid_tokens"] += tmp_outputs["valid_tokens"]
 
             if(self.step >= self.validation_step):
@@ -83,9 +86,10 @@ class MemAugGeneration(DialogGeneration):
                 break
 
         outputs["scheduled_lr"] = tmp_outputs["scheduled_lr"]
-        outputs["token_average_ppl"] = outputs["valid_sum_logp"] / outputs["valid_tokens"]
+        outputs["loss"] = outputs["loss"] / outputs["valid_tokens"]
+        outputs["tokens_ppl"] = math.exp(outputs["valid_sum_logp"] / outputs["valid_tokens"])
         if("valid_sum_aux_logp" in outputs):
-            outputs["auxiliary_token_average_ppl"] = outputs["valid_sum_aux_logp"] / outputs["valid_tokens"]
+            outputs["auxiliary_token_average_ppl"] = math.exp(outputs["valid_sum_aux_logp"] / outputs["valid_tokens"])
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
                    for k, v in outputs.items()}
@@ -113,14 +117,19 @@ class MemAugGeneration(DialogGeneration):
                     outputs["valid_sum_aux_logp"] += tmp_outputs["valid_sum_aux_logp"]
                 else:
                     outputs["valid_sum_aux_logp"] = tmp_outputs["valid_sum_aux_logp"]
+            outputs["loss"] += tmp_outputs["loss"] * tmp_outputs["valid_tokens"]
             outputs["valid_tokens"] += tmp_outputs["valid_tokens"]
-            outputs["loss"] += tmp_outputs["loss"]
 
         outputs["batch_size"] = tmp_outputs["batch_size"]
         outputs["tokens_num"] = tmp_outputs["tokens_num"]
-        outputs["token_average_ppl"] = outputs["valid_sum_logp"] / outputs["valid_tokens"]
+        outputs["loss"] = outputs["loss"] / outputs["valid_tokens"]
+        outputs["tokens_ppl"] = math.exp(outputs["valid_sum_logp"] / outputs["valid_tokens"])
+        if(self.validation_words > 0):
+            outputs["word_normalized_ppl"] = math.exp(outputs["valid_sum_logp"] / self.validation_words)
         if("valid_sum_aux_logp" in outputs):
-            outputs["auxiliary_token_average_ppl"] = outputs["valid_sum_aux_logp"] / outputs["valid_tokens"]
+            outputs["auxiliary_token_average_ppl"] = math.exp(outputs["valid_sum_aux_logp"] / outputs["valid_tokens"])
+            if(self.validation_words > 0):
+                outputs["auxiliary_word_normalized_ppl"] = math.exp(outputs["valid_sum_aux_logp"] / self.validation_words)
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
                    for k, v in outputs.items()}
@@ -129,3 +138,18 @@ class MemAugGeneration(DialogGeneration):
     def infer_step(self, model: ModelInterface, inputs):
         """Run one inference step."""
         raise NotImplementedError("Inference for mem augmented transformer is not yet implemented")
+
+    def get_metrics(self, outputs):
+        """Get metrics."""
+        if outputs is None:
+            raise ValueError("metrics is None")
+        outputs = dict(outputs)
+        metrics = {}
+        batch_size = outputs.pop("batch_size", None)
+        tokens_num = outputs.pop("tokens_num", None)
+        for k in outputs:
+            if k.startswith("token_"):
+                metrics[k[6:]] = outputs[k]
+            else:
+                metrics[k] = outputs[k]
+        return metrics
