@@ -76,14 +76,16 @@ class LongTermMemEncoder(Layer):
 
         # Depending on whether to use relative positions, use MHDA or MHA
         if(rel_pos_layer is None):
-            self.self_attn = MultiHeadAttention(
+            self.use_rel_pos = False
+            self.cross_attn = MultiHeadAttention(
                 d_model,
                 nhead,
                 dropout=attn_dropout,
                 weight_attr=weight_attrs[0],
                 bias_attr=bias_attrs[0])
         else:
-            self.self_attn = MultiHeadRelPosAttention(
+            self.use_rel_pos = True
+            self.cross_attn = MultiHeadRelPosAttention(
                 d_model,
                 nhead,
                 rel_pos_layer=rel_pos_layer,
@@ -110,7 +112,7 @@ class LongTermMemEncoder(Layer):
         ltm_len = ltm.shape[1]
         stm_len = stm.shape[1]
         query = ltm
-        key = paddle.concat(x=[ltm, stm], axis=1)
+        key = stm#paddle.concat(x=[ltm, stm], axis=1)
 
         residual = ltm
 
@@ -119,7 +121,10 @@ class LongTermMemEncoder(Layer):
             query = self.norm1(ltm)
 
         # If relative position is used, the relative start position of key is the same as the relative start position of query
-        output = self.self_attn(query, key, key)
+        if(self.use_rel_pos):
+            output = self.cross_attn(query, key, key, rel_pos_start_key=-stm_len)
+        else:
+            output = self.cross_attn(query, key, key)
 
         output = residual + self.dropout1(output)
         if not self.normalize_before:
