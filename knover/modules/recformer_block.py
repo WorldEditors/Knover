@@ -19,7 +19,7 @@ import collections
 import numpy as np
 
 import paddle
-from paddle.nn import Linear, Dropout
+from paddle.nn import Linear, Dropout, Embedding
 from paddle.nn import LayerNorm
 import paddle.nn.functional as F
 from paddle import tensor
@@ -102,6 +102,11 @@ class LongTermMemEncoder(Layer):
         self.norm2 = LayerNorm(d_model)
         self.dropout1 = Dropout(dropout, mode="upscale_in_train")
         self.dropout2 = Dropout(dropout, mode="upscale_in_train")
+        self.type_emb = self.create_parameter(
+            shape=[2, d_model],
+            attr=weight_attrs[1],
+            dtype=self._dtype,
+            is_bias=False)
         self.activation = getattr(F, activation)
 
     def forward(self, ltm, stm):
@@ -112,7 +117,7 @@ class LongTermMemEncoder(Layer):
         ltm_len = ltm.shape[1]
         stm_len = stm.shape[1]
         query = ltm
-        key = stm#paddle.concat(x=[ltm, stm], axis=1)
+        key = paddle.concat(x=[ltm + self.type_emb[0], stm + self.type_emb[1]], axis=1)
 
         residual = ltm
 
@@ -122,7 +127,7 @@ class LongTermMemEncoder(Layer):
 
         # If relative position is used, the relative start position of key is the same as the relative start position of query
         if(self.use_rel_pos):
-            output = self.cross_attn(query, key, key, rel_pos_start_key=-stm_len)
+            output = self.cross_attn(query, key, key, rel_pos_start_key=0)
         else:
             output = self.cross_attn(query, key, key)
 
