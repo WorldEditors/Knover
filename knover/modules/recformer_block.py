@@ -102,11 +102,11 @@ class LongTermMemEncoder(Layer):
         self.norm2 = LayerNorm(d_model)
         self.dropout1 = Dropout(dropout, mode="upscale_in_train")
         self.dropout2 = Dropout(dropout, mode="upscale_in_train")
-        self.type_emb = self.create_parameter(
-            shape=[2, d_model],
-            attr=weight_attrs[1],
-            dtype=self._dtype,
-            is_bias=False)
+        #self.type_emb = self.create_parameter(
+        #    shape=[2, d_model],
+        #    attr=weight_attrs[1],
+        #    dtype=self._dtype,
+        #    is_bias=False)
         self.activation = getattr(F, activation)
 
     def forward(self, ltm, stm):
@@ -117,7 +117,7 @@ class LongTermMemEncoder(Layer):
         ltm_len = ltm.shape[1]
         stm_len = stm.shape[1]
         query = ltm
-        key = paddle.concat(x=[ltm + self.type_emb[0], stm + self.type_emb[1]], axis=1)
+        key = paddle.concat(x=[ltm, stm], axis=1)
 
         residual = ltm
 
@@ -284,7 +284,7 @@ class MemAugDecoder(Layer):
             self.norm1 = [LayerNorm(d_model) for i in range(num_layers)]
             self.norm2 = LayerNorm(d_model) 
 
-    def forward(self, memories, tgt, tgt_mask=None, caches=None):
+    def forward(self, memories, tgt, additional_memories=None, tgt_mask=None, caches=None, detach_memory=True):
         """
         tgt:  A tensor of shape [Batch, Sequence, Hidden]
         memories:  A NumLayers list of tensor of shape [Batch, Sequence, Hidden]
@@ -294,18 +294,25 @@ class MemAugDecoder(Layer):
             mem_len = 0
         else:
             mem_len = memories[0].shape[1]
-            if(tgt_mask is not None):
-                tgt_mask = paddle.concat([paddle.zeros((seq_len, mem_len)), tgt_mask], axis=1)
+        if(additional_memories is not None):
+            mem_len += additional_memories[0].shape[1]
+        if(tgt_mask is not None and mem_len > 0):
+            tgt_mask = paddle.concat([paddle.zeros((seq_len, mem_len)), tgt_mask], axis=1)
 
         output = tgt
         new_caches = []
         new_memories = []
         new_memories.append(output.detach())
         for i, mod in enumerate(self.layers):
-            if(memories is None):
+            if(mem_len <= 0):
                 mem = None
+            elif(memories is not None and additional_memories is not None):
+                mem = paddle.concat([memories[i], additional_memories[i]], axis=1)
+            elif(memories is not None):
+                mem = memories[i]
             else:
-                mem = self.norm1[i](memories[i]) if self.normalize_before else memories[i]
+                mem = additional_memories[i]
+
             if caches is None:
                 output = mod(mem, output,
                         tgt_mask=tgt_mask,
@@ -315,7 +322,10 @@ class MemAugDecoder(Layer):
                         tgt_mask=tgt_mask,
                         cache=caches["cache"][i])
                 new_caches.append(new_cache)
-            new_memories.append(output.detach())
+            if(detach_memory):
+                new_memories.append(output.detach())
+            else:
+                new_memories.append(output)
 
         if self.normalize_before:
             output = self.norm2(output)

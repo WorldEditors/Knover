@@ -93,8 +93,7 @@ class RecFormer(Model):
                 emb_size = self.hidden_size, weight_attr=param_attr)
 
         self.memory_length = args.get("memory_length", 256)
-        self.recursion_length = args.get("recursion_length", 128)
-        self.aux_loss_weight = args.get("auxiliary_loss_weight", -1.0)
+        self.aux_loss_weight = args.get("auxiliary_loss_weight", 0.1)
 
         # embeddings
         self.vocab_size = args.vocab_size
@@ -218,19 +217,19 @@ class RecFormer(Model):
         """
         emb_input = self._gen_input(
             token_ids, type_ids, role_ids, aux_emb=aux_emb)
+        hid_pairs = (None, None)
         if self._generation_caches is None:
-            res = self._encode(emb_input)
-            enc_out, aux_out = res#self._encode(emb_input)
+            enc_out, hid_pairs = self._encode(emb_input)
         else:
-            enc_out, aux_out, self._generation_caches = self._encode(
+            enc_out, self._generation_caches = self._encode(
                 emb_input, self._generation_caches)
-        return enc_out, aux_out
+        return enc_out, hid_pairs
 
     def _generation_step(self, state):
         # gather caches
         if "parent_idx" in state:
             raise Exception("RecFormer (Transformer-XL) can not support beam search currently")
-        enc_out = self._generation_network(
+        enc_out, hid_pairs = self._generation_network(
             state["token_ids"],
             state["type_ids"],
             state.get("role_ids", None),
@@ -251,51 +250,37 @@ class RecFormer(Model):
         Returns:
             The output embeddings of Transformer.
         """
-        outputs = []
-        _start = 0
-        _stop = emb_input.shape[1]
+        seg_len = emb_input.shape[1]
 
         # Output size [Batch, SegLen, HiddenDim]
-        while _start < _stop:
-            # Update Long Term Memory
-            rec_len = min(_stop - _start, self.recursion_length)
-            _end = _start + rec_len
-            mask = paddle.tensor.triu((paddle.ones(
-                (rec_len, rec_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
+        mask = paddle.tensor.triu((paddle.ones(
+            (seg_len, seg_len), dtype=paddle.get_default_dtype()) * -np.inf), 1)
 
-            self.update_memories(self.st_memories)
-            if(caches is not None):
-                hids, output, caches = self.decoder(self.memories, emb_input[:, _start:_end, :],
-                        tgt_mask=mask, cache=caches)
-            else:
-                hids, output = self.decoder(self.memories, emb_input[:, _start:_end, :],
-                        tgt_mask=mask)
+        if(caches is not None):
+            hids, output, caches = self.decoder(self.memories, emb_input,
+                    additional_memories=self.st_memories,
+                    tgt_mask=mask, cache=caches)
+        else:
+            hids, output = self.decoder(self.memories, emb_input,
+                    additional_memories=self.st_memories,
+                    tgt_mask=mask)
 
-            self.st_memories = hids[:-1]
-            outputs.append(output)
+        self.update_memories(hids)
 
-            _start = _end
-        outputs = paddle.concat(outputs, axis=1)
+        # Recalculate the hids and outputs, only when cache is None (Training Phase)
+        if(caches is None):
+            hids_cont, output_cont = self.decoder(self.memories, emb_input, tgt_mask=mask, detach_memory=False)
 
-        # Auxiliary Decoder
-        if(self.aux_decoder is not None):
-            mask = paddle.tensor.triu((paddle.ones(
-                    (_stop, _stop), dtype=paddle.get_default_dtype()) * -np.inf), 1)
-            aux_hids, aux_outputs = self.aux_decoder(self.memories, emb_input, tgt_mask=mask)
-
-        self.memories = [memory.detach() for memory in self.memories]
+        aux_mse_loss = 0
+        for i in range(self.n_layer):
+            aux_mse_loss += F.mse_loss(hids[i+1], hids_cont[i+1])
 
         # Return outputs
-        if(self.aux_decoder is None):
-            if caches is None:
-                return outputs, None
-            else:
-                return outputs, None, caches
+        self.detach_memories()
+        if caches is None:
+            return output, aux_mse_loss
         else:
-            if caches is None:
-                return outputs, aux_outputs
-            else:
-                return outputs, aux_outputs, caches
+            return output, caches
 
     def _calc_logits(self, enc_out, tgt_idx=None):
         """Get the logits of generation task.
@@ -336,7 +321,7 @@ class RecFormer(Model):
         else:
             self._generation_caches = None
 
-        outputs["enc_out"], outputs["aux_out"] = self._generation_network(
+        outputs["enc_out"], outputs["aux_loss"] = self._generation_network(
             token_ids=inputs["token_ids"],
             type_ids=inputs["type_ids"],
             role_ids=inputs.get("role_ids", None),
@@ -354,14 +339,8 @@ class RecFormer(Model):
             tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"], reduction="none")
             metrics["valid_sum_logp"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
             metrics["valid_tokens"] = paddle.sum(inputs["loss_mask"])
-            if(outputs["aux_out"] is not None):
-                aux_tgt_logits = self._calc_logits(outputs["aux_out"])
-                aux_lm_loss = F.cross_entropy(aux_tgt_logits, inputs["tgt_label"], reduction="none")
-                metrics["valid_sum_aux_logp"] = paddle.sum(aux_lm_loss * inputs["loss_mask"])
-                metrics["loss"] = (metrics["valid_sum_logp"] + self.aux_loss_weight * metrics["valid_sum_aux_logp"]) / (metrics["valid_tokens"] + 1e-8)
-            else:
-                metrics["loss"] = metrics["valid_sum_logp"] / (metrics["valid_tokens"] + 1e-8)
-
+            metrics["auxiliary_loss"] = outputs["aux_loss"]
+            metrics["loss"] = metrics["valid_sum_logp"] / metrics["valid_tokens"] + self.aux_loss_weight * metrics["auxiliary_loss"]
 
         return metrics
 
@@ -385,8 +364,14 @@ class RecFormer(Model):
         self.st_memories = None
 
     def update_memories(self, hids):
-        if(hids is not None):
-            new_memories = []
+        #update long term memory
+        if(self.st_memories is not None):
+            new_lt_mems = []
             for i, layer in enumerate(self.encoders):
-                new_memories.append(layer(self.memories[i], hids[i]))
-            self.memories = new_memories
+                new_lt_mems.append(layer(self.memories[i], self.st_memories[i]))
+            self.memories = new_lt_mems
+        #update short term memory
+        self.st_memories = hids[:-1]
+
+    def detach_memories(self):
+        self.memories = [mem.detach() for mem in self.memories]

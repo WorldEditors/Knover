@@ -72,13 +72,13 @@ class MemAugGeneration(DialogGeneration):
             self.step += 1
 
             outputs["valid_sum_logp"] += tmp_outputs["valid_sum_logp"]
-            if("valid_sum_aux_logp" in tmp_outputs):
-                if("valid_sum_aux_logp" in outputs):
-                    outputs["valid_sum_aux_logp"] += tmp_outputs["valid_sum_aux_logp"]
-                else:
-                    outputs["valid_sum_aux_logp"] = tmp_outputs["valid_sum_aux_logp"]
             outputs["loss"] += tmp_outputs["loss"] * tmp_outputs["valid_tokens"]
             outputs["valid_tokens"] += tmp_outputs["valid_tokens"]
+            if("auxiliary_loss" in tmp_outputs):
+                if("auxiliary_loss" in outputs):
+                    outputs["auxiliary_loss"] +=  tmp_outputs["auxiliary_loss"] * tmp_outputs["valid_tokens"]
+                else:
+                    outputs["auxiliary_loss"] = tmp_outputs["auxiliary_loss"] * tmp_outputs["valid_tokens"]
 
             if(self.step >= self.validation_step):
                 self.step = 0
@@ -87,9 +87,9 @@ class MemAugGeneration(DialogGeneration):
 
         outputs["scheduled_lr"] = tmp_outputs["scheduled_lr"]
         outputs["loss"] = outputs["loss"] / outputs["valid_tokens"]
+        if("auxiliary_loss" in outputs):
+                outputs["auxiliary_loss"] = outputs["auxiliary_loss"] / outputs["valid_tokens"]
         outputs["tokens_ppl"] = math.exp(outputs["valid_sum_logp"] / outputs["valid_tokens"])
-        if("valid_sum_aux_logp" in outputs):
-            outputs["auxiliary_token_average_ppl"] = math.exp(outputs["valid_sum_aux_logp"] / outputs["valid_tokens"])
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
                    for k, v in outputs.items()}
@@ -112,24 +112,22 @@ class MemAugGeneration(DialogGeneration):
             tmp_outputs = model.eval_step(seg_input)
 
             outputs["valid_sum_logp"] += tmp_outputs["valid_sum_logp"]
-            if("valid_sum_aux_logp" in tmp_outputs):
-                if("valid_sum_aux_logp" in outputs):
-                    outputs["valid_sum_aux_logp"] += tmp_outputs["valid_sum_aux_logp"]
-                else:
-                    outputs["valid_sum_aux_logp"] = tmp_outputs["valid_sum_aux_logp"]
             outputs["loss"] += tmp_outputs["loss"] * tmp_outputs["valid_tokens"]
+            if("auxiliary_loss" in tmp_outputs):
+                if("auxiliary_loss" in outputs):
+                    outputs["auxiliary_loss"] +=  tmp_outputs["auxiliary_loss"] * tmp_outputs["valid_tokens"]
+                else:
+                    outputs["auxiliary_loss"] = tmp_outputs["auxiliary_loss"] * tmp_outputs["valid_tokens"]
             outputs["valid_tokens"] += tmp_outputs["valid_tokens"]
 
         outputs["batch_size"] = tmp_outputs["batch_size"]
         outputs["tokens_num"] = tmp_outputs["tokens_num"]
         outputs["loss"] = outputs["loss"] / outputs["valid_tokens"]
+        if("auxiliary_loss" in outputs):
+                outputs["auxiliary_loss"] = outputs["auxiliary_loss"] / outputs["valid_tokens"]
         outputs["tokens_ppl"] = math.exp(outputs["valid_sum_logp"] / outputs["valid_tokens"])
         if(self.validation_words > 0):
             outputs["word_normalized_ppl"] = math.exp(outputs["valid_sum_logp"] / self.validation_words)
-        if("valid_sum_aux_logp" in outputs):
-            outputs["auxiliary_token_average_ppl"] = math.exp(outputs["valid_sum_aux_logp"] / outputs["valid_tokens"])
-            if(self.validation_words > 0):
-                outputs["auxiliary_word_normalized_ppl"] = math.exp(outputs["valid_sum_aux_logp"] / self.validation_words)
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
                    for k, v in outputs.items()}
