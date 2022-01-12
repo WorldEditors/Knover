@@ -62,6 +62,9 @@ class TransformerXL(Model):
         self.d_value = args.get("value_size", self.hidden_size // self.n_head)
         self.inner_hidden_size = args.get("inner_hidden_size", self.hidden_size * 4)
         self.memory_length = args.get("memory_length", 256)
+        # 0, naive transformer XL; 1, cross layer recurrence
+        self.rec_style = args.get("rec_style", 0)
+        print("recursion stype is: %d"%self.rec_style)
 
         # embeddings
         self.vocab_size = args.vocab_size
@@ -239,7 +242,7 @@ class TransformerXL(Model):
             hids, output = self.decoder(self.memories, emb_input, mask)
 
         # Update Short Term Memory
-        self.update_memories(hids)
+        self.update_memories(hids, self.rec_style)
 
         # Re-concatenate all the results
 
@@ -324,12 +327,20 @@ class TransformerXL(Model):
     def reset_memories(self, batch_size):
         self.memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * self.n_layer
 
-    def update_memories(self, hids):
+    def update_memories(self, hids, rec_style):
         new_memories = []
         mem_len = self.memories[0].shape[1]
         hid_len = hids[0].shape[1]
         max_len = mem_len + hid_len
-        for i, hid in enumerate(hids):
+        if(rec_style == 0):
+            #naive XL
+            st_mems = hids[:-1]
+        elif(rec_style == 1):
+            #cross layer
+            st_mems = hids[1:]
+        else:
+            raise Exception("No such recursion style:", rec_style)
+        for i, hid in enumerate(st_mems):
             if(hid_len <= mem_len):
                 new_hid = paddle.concat([self.memories[i], hid], axis=1)
             else:

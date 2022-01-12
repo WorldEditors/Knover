@@ -316,7 +316,6 @@ class MemAugDecoder(Layer):
                         cache=caches["cache"][i])
                 new_caches.append(new_cache)
             new_memories.append(output.detach())
-        del new_memories[-1]
 
         if self.normalize_before:
             output = self.norm2(output)

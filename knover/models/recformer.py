@@ -265,13 +265,14 @@ class RecFormer(Model):
 
             self.update_memories(self.st_memories)
             if(caches is not None):
-                self.st_memories, output, caches = self.decoder(self.memories, emb_input[:, _start:_end, :],
+                hids, output, caches = self.decoder(self.memories, emb_input[:, _start:_end, :],
                         tgt_mask=mask, cache=caches)
             else:
-                self.st_memories, output = self.decoder(self.memories, emb_input[:, _start:_end, :],
+                hids, output = self.decoder(self.memories, emb_input[:, _start:_end, :],
                         tgt_mask=mask)
-            outputs.append(output)
 
+            self.st_memories = hids[:-1]
+            outputs.append(output)
 
             _start = _end
         outputs = paddle.concat(outputs, axis=1)
@@ -280,7 +281,7 @@ class RecFormer(Model):
         if(self.aux_decoder is not None):
             mask = paddle.tensor.triu((paddle.ones(
                     (_stop, _stop), dtype=paddle.get_default_dtype()) * -np.inf), 1)
-            stms, aux_outputs = self.aux_decoder(self.memories, emb_input, tgt_mask=mask)
+            aux_hids, aux_outputs = self.aux_decoder(self.memories, emb_input, tgt_mask=mask)
 
         self.memories = [memory.detach() for memory in self.memories]
 
