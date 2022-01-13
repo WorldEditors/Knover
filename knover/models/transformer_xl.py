@@ -237,9 +237,9 @@ class TransformerXL(Model):
             (l_s, l_s), dtype=paddle.get_default_dtype()) * -1.0e+10), 1)
 
         if(caches is not None):
-            hids, output, caches = self.decoder(self.memories, emb_input, tgt_mask=mask, cache=caches)
+            hids, output, caches = self.decoder(self.memories, emb_input, detach_memory=True, tgt_mask=mask, cache=caches)
         else:
-            hids, output = self.decoder(self.memories, emb_input, tgt_mask=mask)
+            hids, output = self.decoder(self.memories, emb_input, detach_memory=True, tgt_mask=mask)
 
         # Update Short Term Memory
         self.update_memories(hids, self.rec_style)
