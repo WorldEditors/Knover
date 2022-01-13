@@ -28,7 +28,7 @@ from paddle.nn import Layer, LayerList
 from paddle.framework import ParamAttr
 from paddle.fluid.data_feeder import convert_dtype
 from paddle.nn.layer.transformer import _convert_attention_mask, _convert_param_attr_to_list, MultiHeadAttention
-from knover.modules.rel_pos_attention import MultiHeadRelPosAttention
+from knover.modules.rel_pos_attention import LinearWrapper, MultiHeadRelPosAttention
 
 __all__ = []
 
@@ -205,10 +205,10 @@ class MemAugDecoderLayer(Layer):
                 weight_attr=weight_attrs[0],
                 bias_attr=bias_attrs[0])
 
-        self.linear1 = Linear(
+        self.linear1 = LinearWrapper(
             d_model, dim_feedforward, weight_attrs[1], bias_attr=bias_attrs[1])
         self.dropout = Dropout(act_dropout, mode="upscale_in_train")
-        self.linear2 = Linear(
+        self.linear2 = LinearWrapper(
             dim_feedforward, d_model, weight_attrs[1], bias_attr=bias_attrs[1])
         self.norm1 = LayerNorm(d_model)
         self.norm2 = LayerNorm(d_model)
@@ -216,7 +216,7 @@ class MemAugDecoderLayer(Layer):
         self.dropout2 = Dropout(dropout, mode="upscale_in_train")
         self.activation = getattr(F, activation)
 
-    def forward(self, memory, tgt, tgt_mask=None, cache=None):
+    def forward(self, memory, tgt, tgt_mask=None, cache=None, parameter_no_grad=False):
         """
         src: source to be encoded into the memory, should be tensor of size [Batch, SeqLen, Hidden]
         memory: tensor of size [Batch, SegmentLen, Hidden]
@@ -239,10 +239,12 @@ class MemAugDecoderLayer(Layer):
         # Notice that the key position starts from -l_m here 
         if(self.use_rel_pos):
             if(cache is None):
-                output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, rel_pos_start_key=-l_m)
+                output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, rel_pos_start_key=-l_m, parameter_no_grad=parameter_no_grad)
             else:
-                output, new_cache = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, rel_pos_start_key=-l_m, cache=cache)
+                output, new_cache = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask, rel_pos_start_key=-l_m, cache=cache, parameter_no_grad=parameter_no_grad)
         else:
+            if(parameter_no_grad):
+                raise Exception("Currently Regular MHA can not support parameter_no_grad")
             if(cache is None):
                 output = self.self_attn(tgt, concat_src, concat_src, attn_mask=tgt_mask)
             else:
@@ -258,7 +260,7 @@ class MemAugDecoderLayer(Layer):
         if self.normalize_before:
             output = self.norm2(output)
 
-        output = self.linear2(self.dropout(self.activation(self.linear1(output))))
+        output = self.linear2(self.dropout(self.activation(self.linear1(output, parameter_no_grad=parameter_no_grad))), parameter_no_grad=parameter_no_grad)
         output = residual + self.dropout2(output)
         if not self.normalize_before:
             output = self.norm2(output)
@@ -284,10 +286,14 @@ class MemAugDecoder(Layer):
             self.norm1 = [LayerNorm(d_model) for i in range(num_layers)]
             self.norm2 = LayerNorm(d_model) 
 
-    def forward(self, memories, tgt, additional_memories=None, tgt_mask=None, caches=None, detach_memory=True):
+    def forward(self, memories, tgt, additional_memories=None, tgt_mask=None, caches=None, detach_memory=False, detach_tgt=False, parameter_no_grad=False):
         """
         tgt:  A tensor of shape [Batch, Sequence, Hidden]
         memories:  A NumLayers list of tensor of shape [Batch, Sequence, Hidden]
+
+        detach_memory: returning a detached memory or non-detached memory
+        detach_input:  detach tgt_input or not
+        parameter_no_grad:  use static (fixed) parameter (do not backward the parameter)
         """
         seq_len = tgt.shape[1]
         if(memories is None):
@@ -299,10 +305,16 @@ class MemAugDecoder(Layer):
         if(tgt_mask is not None and mem_len > 0):
             tgt_mask = paddle.concat([paddle.zeros((seq_len, mem_len)), tgt_mask], axis=1)
 
-        output = tgt
+
         new_caches = []
         new_memories = []
-        new_memories.append(output.detach())
+        if(not detach_tgt):
+            output = tgt
+            new_memories.append(output.detach())
+        else:
+            output = tgt.detach()
+            new_memories.append(output)
+
         for i, mod in enumerate(self.layers):
             if(mem_len <= 0):
                 mem = None
@@ -316,11 +328,11 @@ class MemAugDecoder(Layer):
             if caches is None:
                 output = mod(mem, output,
                         tgt_mask=tgt_mask,
-                        cache=None)
+                        cache=None, parameter_no_grad=parameter_no_grad)
             else:
                 output, new_cache = mod(mem, output,
                         tgt_mask=tgt_mask,
-                        cache=caches["cache"][i])
+                        cache=caches["cache"][i], parameter_no_grad=parameter_no_grad)
                 new_caches.append(new_cache)
             if(detach_memory):
                 new_memories.append(output.detach())
@@ -332,12 +344,12 @@ class MemAugDecoder(Layer):
 
         return new_memories, output if caches is None else (new_memories, output, new_caches)
 
-    def gen_cache(self, tgt, do_zip=False):
+    def gen_cache(self, tgt, do_zip=False, parameter_no_grad=False):
         """
         Memory, tensor of [Batch, NumLayer, Sequence, Hidden]
         seg_idx, [0, seg_idx) represents the range of the memory
         """
-        cache = [layer.gen_cache(tgt) for layer in self.layers]
+        cache = [layer.gen_cache(tgt, parameter_no_grad=parameter_no_grad) for layer in self.layers]
         if do_zip:
             cache = list(zip(*cache))
         return cache

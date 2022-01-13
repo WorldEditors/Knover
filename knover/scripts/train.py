@@ -138,7 +138,7 @@ def train(args):
     if use_vdl:
         if args.on_k8s:
             import expt
-            expt.init(name=os.getenv("EXPT_NAME", "DEBUG"))
+            expt.init(name=os.getenv("EXPT_NAME", "DEFAULT"))
             expt.set_params(args.Model)
             writer = expt
         else:

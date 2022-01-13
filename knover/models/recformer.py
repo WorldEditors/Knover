@@ -259,17 +259,23 @@ class RecFormer(Model):
         if(caches is not None):
             hids, output, caches = self.decoder(self.memories, emb_input,
                     additional_memories=self.st_memories,
-                    tgt_mask=mask, cache=caches)
+                    detach_memory=True,
+                    tgt_mask=mask, 
+                    cache=caches)
         else:
             hids, output = self.decoder(self.memories, emb_input,
                     additional_memories=self.st_memories,
+                    detach_memory=True,
                     tgt_mask=mask)
 
         self.update_memories(hids)
 
-        # Recalculate the hids and outputs, only when cache is None (Training Phase)
+        #Recalculate the hids and outputs, only when cache is None (Training Phase)
         if(caches is None):
-            hids_cont, output_cont = self.decoder(self.memories, emb_input, tgt_mask=mask, detach_memory=False)
+            hids_cont, output_cont = self.decoder(self.memories, emb_input, tgt_mask=mask, 
+                    detach_memory=False,
+                    detach_tgt=True,
+                    parameter_no_grad=True)
 
         aux_mse_loss = 0
         for i in range(self.n_layer):

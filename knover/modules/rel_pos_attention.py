@@ -65,6 +65,25 @@ class RelPosLayer(Layer):
     def emb_2_relative_pos(self, idx):
         return idx + self.rel_min
 
+    def position_embedding(self, parameter_no_grad=False):
+        if(not parameter_no_grad):
+            return self.position_emb
+        else:
+            return self.position_emb.detach()
+
+class LinearWrapper(Linear):    
+    """
+    A Linear Layer with detached parameters
+    """
+    def forward(self, input, parameter_no_grad=False):
+        if(not parameter_no_grad):
+            out = F.linear(
+                x=input, weight=self.weight, bias=self.bias, name=self.name)
+        else:
+            out = F.linear(
+                x=input, weight=self.weight.detach(), bias=self.bias.detach(), name=self.name)
+        return out
+
 class MultiHeadRelPosAttention(Layer):
     """
     Relative Position Attention Layer (DeBerta Type Relative Positions) 
@@ -105,31 +124,31 @@ class MultiHeadRelPosAttention(Layer):
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
 
-        self.q_proj = Linear(
+        self.q_proj = LinearWrapper(
             embed_dim, 2 * embed_dim, weight_attr, bias_attr=bias_attr)
-        self.k_proj = Linear(
+        self.k_proj = LinearWrapper(
             self.kdim, embed_dim, weight_attr, bias_attr=bias_attr)
-        self.v_proj = Linear(
+        self.v_proj = LinearWrapper(
             self.vdim, embed_dim, weight_attr, bias_attr=bias_attr)
-        self.out_proj = Linear(
+        self.out_proj = LinearWrapper(
             embed_dim, embed_dim, weight_attr, bias_attr=bias_attr)
-        self.kr_proj = Linear(
+        self.kr_proj = LinearWrapper(
             self.pdim, embed_dim, weight_attr, bias_attr=bias_attr)
 
         # Use relative position or not
         assert isinstance(rel_pos_layer, RelPosLayer), "Argument `rel_pos_layer` in MHDA must be Type of RelPosLayer"
         self.rel_pos_layer = rel_pos_layer
 
-    def _prepare_qkv(self, query, key, value, cache=None):
+    def _prepare_qkv(self, query, key, value, cache=None, parameter_no_grad=False):
         r"""
         """
-        q = self.q_proj(query)
+        q = self.q_proj(query, parameter_no_grad=parameter_no_grad)
         qw, qr = paddle.chunk(q, chunks=2, axis=-1)
         qw = tensor.reshape(x=qw, shape=[0, 0, self.num_heads, self.head_dim])
         qw = tensor.transpose(x=qw, perm=[0, 2, 1, 3])
         qr = tensor.reshape(x=qr, shape=[0, 0, self.num_heads, self.head_dim])
         qr = tensor.transpose(x=qr, perm=[0, 2, 1, 3])
-        kr = self.kr_proj(self.rel_pos_layer.position_emb)
+        kr = self.kr_proj(self.rel_pos_layer.position_embedding(parameter_no_grad=parameter_no_grad), parameter_no_grad=parameter_no_grad)
         kr = tensor.reshape(x=kr, shape=[0, -1, self.num_heads, self.head_dim])
         kr = tensor.transpose(x=kr, perm=[1, 2, 0, 3])
 
@@ -137,7 +156,7 @@ class MultiHeadRelPosAttention(Layer):
             # for encoder-decoder attention in inference and has cached
             k, v = cache.k, cache.v
         else:
-            k, v = self.compute_kv(key, value)
+            k, v = self.compute_kv(key, value, parameter_no_grad=parameter_no_grad)
 
         if isinstance(cache, self.Cache):
             # for decoder self-attention in inference
@@ -147,18 +166,18 @@ class MultiHeadRelPosAttention(Layer):
 
         return (qw, qr, k, v, kr) if cache is None else (qw, qr, k, v, kr, cache)
 
-    def compute_kv(self, key, value):
-        k = self.k_proj(key)
-        v = self.v_proj(value)
+    def compute_kv(self, key, value, parameter_no_grad=False):
+        k = self.k_proj(key, parameter_no_grad=parameter_no_grad)
+        v = self.v_proj(value, parameter_no_grad=parameter_no_grad)
         k = tensor.reshape(x=k, shape=[0, 0, self.num_heads, self.head_dim])
         k = tensor.transpose(x=k, perm=[0, 2, 1, 3])
         v = tensor.reshape(x=v, shape=[0, 0, self.num_heads, self.head_dim])
         v = tensor.transpose(x=v, perm=[0, 2, 1, 3])
         return k, v
 
-    def gen_cache(self, key, value=None, type=Cache):
+    def gen_cache(self, key, value=None, type=Cache, parameter_no_grad=False):
         if type == MultiHeadAttention.StaticCache:  # static_kv
-            k, v = self.compute_kv(key, value)
+            k, v = self.compute_kv(key, value, parameter_no_grad=parameter_no_grad)
             return self.StaticCache(k, v)
         elif value is None:  # incremental_state
             k = layers.fill_constant_batch_size_like(
@@ -176,7 +195,7 @@ class MultiHeadRelPosAttention(Layer):
             # incremental_state with initial value, mainly for usage like UniLM
             return self.Cache(key, value)
 
-    def forward(self, query, key=None, value=None, rel_pos_start_key=0, attn_mask=None, cache=None):
+    def forward(self, query, key=None, value=None, rel_pos_start_key=0, attn_mask=None, cache=None, parameter_no_grad=False):
         """
         rel_pos_start_key:  the relative position of the start position of key with respect to the start of query
                 e.g.,  for query = key, rel_pos_start_key = 0
@@ -206,9 +225,9 @@ class MultiHeadRelPosAttention(Layer):
 
         # compute q ,k ,v
         if cache is None:
-            qw, qr, k, v, kr = self._prepare_qkv(query, key, value, cache)
+            qw, qr, k, v, kr = self._prepare_qkv(query, key, value, cache, parameter_no_grad=parameter_no_grad)
         else:
-            qw, qr, k, v, kr, cache = self._prepare_qkv(query, key, value, cache)
+            qw, qr, k, v, kr, cache = self._prepare_qkv(query, key, value, cache, parameter_no_grad=parameter_no_grad)
 
         alpha = self.head_dim**-0.5
         # scale dot product attention
@@ -265,7 +284,7 @@ class MultiHeadRelPosAttention(Layer):
         out = tensor.reshape(x=out, shape=[0, 0, out.shape[2] * out.shape[3]])
 
         # project to output
-        out = self.out_proj(out)
+        out = self.out_proj(out, parameter_no_grad=parameter_no_grad)
 
         outs = [out]
         if self.need_weights:
