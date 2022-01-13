@@ -123,11 +123,9 @@ class MemAugGeneration(DialogGeneration):
         outputs["batch_size"] = tmp_outputs["batch_size"]
         outputs["tokens_num"] = tmp_outputs["tokens_num"]
         outputs["loss"] = outputs["loss"] / outputs["valid_tokens"]
-        if("auxiliary_loss" in outputs):
+        if("token_auxiliary_loss" in outputs):
                 outputs["auxiliary_loss"] = outputs["auxiliary_loss"] / outputs["valid_tokens"]
-        outputs["tokens_ppl"] = math.exp(outputs["valid_sum_logp"] / outputs["valid_tokens"])
-        if(self.validation_words > 0):
-            outputs["word_normalized_ppl"] = math.exp(outputs["valid_sum_logp"] / self.validation_words)
+        outputs["token_token_ppl"] = math.exp(outputs["valid_sum_logp"] / outputs["valid_tokens"])
 
         outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
                    for k, v in outputs.items()}
@@ -151,3 +149,50 @@ class MemAugGeneration(DialogGeneration):
             else:
                 metrics[k] = outputs[k]
         return metrics
+
+    def merge_metrics_and_statistics(self, outputs, part_outputs):
+        """Merge two evaulation output.
+
+        Args:
+            outputs: Original outputs which contains metrics and statistics.
+            part_outputs: New outputs which contains metrics and statistics.
+
+        Returns:
+            Return merged output which contains metrics and statistics.
+        """
+        if outputs is None:
+            return part_outputs
+
+        if part_outputs is None:
+            return outputs
+
+        batch_size = outputs.pop("batch_size")
+        tokens_num = outputs.pop("tokens_num")
+        valid_tokens = outputs.pop("valid_tokens")
+        valid_sum_logp = outputs.pop("valid_sum_logp")
+        part_batch_size = part_outputs.pop("batch_size")
+        part_tokens_num = part_outputs.pop("tokens_num")
+        part_valid_tokens = part_outputs.pop("valid_tokens")
+        part_valid_sum_logp = part_outputs.pop("valid_sum_logp")
+
+        new_outputs = {
+            "batch_size": batch_size + part_batch_size,
+            "tokens_num": tokens_num + part_tokens_num,
+            "valid_tokens": valid_tokens + part_valid_tokens,
+            "valid_sum_logp": valid_sum_logp + part_valid_sum_logp,
+        }
+
+        for k in outputs:
+            if k.startswith("token_"):
+                new_outputs[k] = (
+                    outputs[k] * tokens_num + part_outputs[k] * part_tokens_num
+                ) / new_outputs["tokens_num"]
+            elif(k != "word_normalized_ppl"):
+                new_outputs[k] = (
+                    outputs[k] * batch_size + part_outputs[k] * part_batch_size
+                ) / new_outputs["batch_size"]
+
+        if(self.validation_words > 0):
+            new_outputs["word_normalized_ppl"] = math.exp(new_outputs["valid_sum_logp"] / self.validation_words)
+
+        return new_outputs
