@@ -303,17 +303,17 @@ class TransformerXL(Model):
         else:
             tgt_logits = self._calc_logits(outputs["enc_out"])
             tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"], reduction="none")
-            metrics["valid_sum_logp"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
-            metrics["valid_tokens"] = paddle.sum(inputs["loss_mask"])
-            metrics["loss"] = metrics["valid_sum_logp"] / (metrics["valid_tokens"] + 1e-8)
+            metrics["sum_tokens_logp"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
+            metrics["tokens_num"] = paddle.sum(inputs["loss_mask"])
+            metrics["loss"] = metrics["sum_tokens_logp"] / (metrics["tokens_num"] + 1e-8)
 
         return metrics
 
     def get_statistics(self, inputs, outputs):
         """Get statistics."""
         statistics = {}
-        if "tgt_label" in inputs:
-            statistics["tokens_num"] = inputs["tgt_label"].shape[0]
+        #if "tgt_label" in inputs:
+        #    statistics["tokens_num"] = outputs["tokens_num"]
         statistics["batch_size"] = inputs["token_ids"].shape[0]
         return statistics
 

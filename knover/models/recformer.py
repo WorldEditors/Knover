@@ -61,16 +61,16 @@ class RecFormer(Model):
         self.inner_hidden_size = args.get("inner_hidden_size", self.hidden_size * 4)
 
         self.memory_length = args.get("memory_length", 256)
-        self.recursion_length = args.get("recursion_length", 128)
-        self.aux_loss_weight = args.get("auxiliary_loss_weight", -1.0)
+        self.max_segment_length = args.get("max_segment_length", 256)
+        self.aux_loss_weight = args.get("auxiliary_loss_weight", 0.1)
 
-        max_rel_len = self.memory_length + self.recursion_length
+        max_mem_len = self.memory_length +  self.max_segment_length
 
-        self.dec_relative_position_min = args.get("dec_relative_position_min", -max_rel_len)
+        self.dec_relative_position_min = args.get("dec_relative_position_min", - (max_mem_len + self.max_segment_length))
         self.dec_relative_position_max = args.get("dec_relative_position_max", 0)
 
         self.enc_relative_position_min = args.get("enc_relative_position_min", -self.memory_length)
-        self.enc_relative_position_max = args.get("enc_relative_position_max", max_rel_len)
+        self.enc_relative_position_max = args.get("enc_relative_position_max", max_mem_len)
 
         # embeddings
         self.vocab_size = args.vocab_size
@@ -91,9 +91,6 @@ class RecFormer(Model):
         self.rel_pos_layer_dec = RelPosLayer(rel_min=self.dec_relative_position_min, 
                 rel_max = self.dec_relative_position_max, 
                 emb_size = self.hidden_size, weight_attr=param_attr)
-
-        self.memory_length = args.get("memory_length", 256)
-        self.aux_loss_weight = args.get("auxiliary_loss_weight", 0.1)
 
         # embeddings
         self.vocab_size = args.vocab_size
@@ -277,9 +274,10 @@ class RecFormer(Model):
                     detach_tgt=True,
                     parameter_no_grad=True)
 
-        aux_mse_loss = 0
-        for i in range(self.n_layer):
-            aux_mse_loss += F.mse_loss(hids[i+1], hids_cont[i+1])
+        aux_mse_loss = paddle.mean(F.mse_loss(hids[1], hids_cont[1], reduction="none"), axis=-1)
+        for i in range(1, self.n_layer):
+            aux_mse_loss += paddle.mean(F.mse_loss(hids[i+1], hids_cont[i+1], reduction="none"), axis=-1)
+        aux_mse_loss *= 1.0 / self.n_layer
 
         # Return outputs
         self.detach_memories()
@@ -343,18 +341,20 @@ class RecFormer(Model):
         else:
             tgt_logits = self._calc_logits(outputs["enc_out"])
             tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"], reduction="none")
-            metrics["valid_sum_logp"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
-            metrics["valid_tokens"] = paddle.sum(inputs["loss_mask"])
-            metrics["auxiliary_loss"] = outputs["aux_loss"]
-            metrics["loss"] = metrics["valid_sum_logp"] / metrics["valid_tokens"] + self.aux_loss_weight * metrics["auxiliary_loss"]
+
+            metrics["sum_tokens_logp"] = paddle.sum(tgt_lm_loss * inputs["loss_mask"])
+            metrics["tokens_num"] = paddle.sum(inputs["loss_mask"])
+            metrics["sum_tokens_aux_mse"] = paddle.sum(outputs["aux_loss"] * inputs["loss_mask"])
+
+            metrics["loss"] = metrics["sum_tokens_logp"] / metrics["tokens_num"] + self.aux_loss_weight * metrics["sum_tokens_aux_mse"] / metrics["tokens_num"]
 
         return metrics
 
     def get_statistics(self, inputs, outputs):
         """Get statistics."""
         statistics = {}
-        if "tgt_label" in inputs:
-            statistics["tokens_num"] = inputs["tgt_label"].shape[0]
+        #if "tgt_label" in inputs:
+        #    statistics["tokens_num"] = outputs["tokens_num"]
         statistics["batch_size"] = inputs["token_ids"].shape[0]
         return statistics
 

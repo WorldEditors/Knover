@@ -127,7 +127,7 @@ class DialogReader(object):
         # model related
         self.use_role = args.use_role
 
-        self.fields = ["token_ids", "type_ids", "pos_ids"]
+        self.fields = ["token_ids", "type_ids", "pos_ids", "sta_words", "sta_bit"]
         if args.use_role:
             self.fields.append("role_ids")
         self.num_numerical_fields = len(self.fields)
@@ -320,6 +320,10 @@ class DialogReader(object):
         field_values["tgt_start_idx"] = tgt_start_idx
         field_values["data_id"] = example.data_id
 
+        for key in example._fields:
+            if(key.startswith("sta_")):
+                field_values[key] = int(example.__getattribute__(key))
+
         record = self.Record(**field_values)
         return record
 
@@ -327,6 +331,10 @@ class DialogReader(object):
         """Read a tab separated value file and yield records."""
         headers = next(fp).rstrip("\n").split(delimiter)
         headers.append("data_id")
+        self.sta_keys = []
+        for key in headers:
+            if(key.startswith("sta_") and key in self.fields):
+                self.sta_keys.append(key)
         Example = namedtuple("Example", headers)
 
         for i, line in enumerate(fp):
@@ -627,6 +635,12 @@ class DialogReader(object):
         batch["pos_ids"] = pad_batch_data(batch_pos_ids, pad_id=0)
         if self.use_role:
             batch["role_ids"] = pad_batch_data(batch_role_ids, pad_id=0)
+        for key in self.sta_keys:
+            batch[key] = 0
+
+        for record in batch_records:
+            for key in self.sta_keys:
+                batch[key] += record.__getattribute__(key)
 
         if self.is_autoregressive:
             batch_tgt_start_idx = [0 for record in batch_records]

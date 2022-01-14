@@ -55,14 +55,34 @@ class MemAugGeneration(DialogGeneration):
                 help="used for calculate ppl_per_word")
         DialogGeneration.add_cmdline_args(parser)
 
+    def merge_outputs_inbatch(self, outputs, part_outputs):
+        new_outputs = dict(outputs)
+        for key in part_outputs:
+            if((key.startswith("sum_tokens_") or key == "tokens_num") and key in outputs):
+                new_outputs[key] += part_outputs[key]
+            else:
+                new_outputs[key] = part_outputs[key]
+        return new_outputs
+
+    def post_process(self, outputs, info):
+        """
+        outputs: dicts of statistics
+        additional_info: dicts of other cnt number
+        """
+        new_outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
+                   for k, v in outputs.items()}
+        for key in info:
+            if(key.startswith("sta_")):
+                new_outputs[key] = info[key]
+        return new_outputs
+
     def train_step(self, model: ModelInterface, inputs):
         """Run one training step."""
         inputs = dict(zip(model.model.feed_names, inputs))
         
         model.model.reset_memories(inputs["batch_size"])
-        outputs = {"valid_sum_logp": 0.0, "valid_tokens":0.0, "loss":0.0}
+        outputs = dict()
         seg_num = inputs["seg_num"]
-        sum_lm_mask = 0.0
 
         for i in range(inputs["seg_num"]):
             #avoiding large memories, do some detach
@@ -71,29 +91,14 @@ class MemAugGeneration(DialogGeneration):
             tmp_outputs = model.train_step(seg_input)
             self.step += 1
 
-            outputs["valid_sum_logp"] += tmp_outputs["valid_sum_logp"]
-            outputs["loss"] += tmp_outputs["loss"] * tmp_outputs["valid_tokens"]
-            outputs["valid_tokens"] += tmp_outputs["valid_tokens"]
-            if("auxiliary_loss" in tmp_outputs):
-                if("auxiliary_loss" in outputs):
-                    outputs["auxiliary_loss"] +=  tmp_outputs["auxiliary_loss"] * tmp_outputs["valid_tokens"]
-                else:
-                    outputs["auxiliary_loss"] = tmp_outputs["auxiliary_loss"] * tmp_outputs["valid_tokens"]
+            outputs = self.merge_outputs_inbatch(outputs, tmp_outputs)
 
             if(self.step >= self.validation_step):
                 self.step = 0
                 outputs["require_validation"] = True
                 break
 
-        outputs["scheduled_lr"] = tmp_outputs["scheduled_lr"]
-        outputs["loss"] = outputs["loss"] / outputs["valid_tokens"]
-        if("auxiliary_loss" in outputs):
-                outputs["auxiliary_loss"] = outputs["auxiliary_loss"] / outputs["valid_tokens"]
-        outputs["tokens_ppl"] = math.exp(outputs["valid_sum_logp"] / outputs["valid_tokens"])
-
-        outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
-                   for k, v in outputs.items()}
-
+        outputs = self.post_process(outputs, inputs)
         return outputs
 
     def eval_step(self, model: ModelInterface, inputs):
@@ -101,34 +106,17 @@ class MemAugGeneration(DialogGeneration):
         inputs = dict(zip(model.model.feed_names, inputs))
 
         model.model.reset_memories(inputs["batch_size"])
-        outputs = {"valid_sum_logp": 0.0, "valid_tokens":0.0, "loss":0.0}
+        outputs = dict()
         seg_num = inputs["seg_num"]
-        sum_lm_mask = 0.0
 
         for i in range(inputs["seg_num"]):
             #avoiding large memories, do some detach
             seg_len = inputs["segment_lengths"][i]
             seg_input = {k:inputs[k][i, :, :seg_len] for k in self.train_keys}
             tmp_outputs = model.eval_step(seg_input)
+            outputs = self.merge_outputs_inbatch(outputs, tmp_outputs)
 
-            outputs["valid_sum_logp"] += tmp_outputs["valid_sum_logp"]
-            outputs["loss"] += tmp_outputs["loss"] * tmp_outputs["valid_tokens"]
-            if("auxiliary_loss" in tmp_outputs):
-                if("auxiliary_loss" in outputs):
-                    outputs["auxiliary_loss"] +=  tmp_outputs["auxiliary_loss"] * tmp_outputs["valid_tokens"]
-                else:
-                    outputs["auxiliary_loss"] = tmp_outputs["auxiliary_loss"] * tmp_outputs["valid_tokens"]
-            outputs["valid_tokens"] += tmp_outputs["valid_tokens"]
-
-        outputs["batch_size"] = tmp_outputs["batch_size"]
-        outputs["tokens_num"] = tmp_outputs["tokens_num"]
-        outputs["loss"] = outputs["loss"] / outputs["valid_tokens"]
-        if("token_auxiliary_loss" in outputs):
-                outputs["auxiliary_loss"] = outputs["auxiliary_loss"] / outputs["valid_tokens"]
-        outputs["token_token_ppl"] = math.exp(outputs["valid_sum_logp"] / outputs["valid_tokens"])
-
-        outputs = {k: v.tolist()[0] if isinstance(v, np.ndarray) else v
-                   for k, v in outputs.items()}
+        outputs = self.post_process(outputs, inputs)
         return outputs
 
     def infer_step(self, model: ModelInterface, inputs):
@@ -141,13 +129,25 @@ class MemAugGeneration(DialogGeneration):
             raise ValueError("metrics is None")
         outputs = dict(outputs)
         metrics = {}
-        batch_size = outputs.pop("batch_size", None)
-        tokens_num = outputs.pop("tokens_num", None)
-        for k in outputs:
-            if k.startswith("token_"):
-                metrics[k[6:]] = outputs[k]
+        sta_keys = {}
+        for key in outputs:
+            if(key.startswith("sta_")):
+                sta_keys[key] = outputs[key]
+
+        for key in outputs:
+            if(key.startswith("sum_tokens_")):
+                metrics["avg_tokens_" + key[11:]] = outputs[key] / outputs["tokens_num"]
+                for sta_key in sta_keys:
+                    metrics["avg_" + sta_key[4:] + key[10:]] = outputs[key] / outputs[sta_key]
             else:
-                metrics[k] = outputs[k]
+                metrics[key] = outputs[key]
+        avg_metrics = dict()
+        for key in metrics:
+            if(key.endswith("_logp") and key.startswith("avg_")):
+                avg_metrics[key.replace("_logp", "_ppl")] = math.exp(metrics[key])
+        metrics.update(avg_metrics)
+        metrics = {key: float(metrics[key].numpy()) if paddle.is_tensor(metrics[key]) else float(metrics[key]) for key in metrics}
+
         return metrics
 
     def merge_metrics_and_statistics(self, outputs, part_outputs):
@@ -162,37 +162,14 @@ class MemAugGeneration(DialogGeneration):
         """
         if outputs is None:
             return part_outputs
-
         if part_outputs is None:
             return outputs
 
-        batch_size = outputs.pop("batch_size")
-        tokens_num = outputs.pop("tokens_num")
-        valid_tokens = outputs.pop("valid_tokens")
-        valid_sum_logp = outputs.pop("valid_sum_logp")
-        part_batch_size = part_outputs.pop("batch_size")
-        part_tokens_num = part_outputs.pop("tokens_num")
-        part_valid_tokens = part_outputs.pop("valid_tokens")
-        part_valid_sum_logp = part_outputs.pop("valid_sum_logp")
-
-        new_outputs = {
-            "batch_size": batch_size + part_batch_size,
-            "tokens_num": tokens_num + part_tokens_num,
-            "valid_tokens": valid_tokens + part_valid_tokens,
-            "valid_sum_logp": valid_sum_logp + part_valid_sum_logp,
-        }
-
-        for k in outputs:
-            if k.startswith("token_"):
-                new_outputs[k] = (
-                    outputs[k] * tokens_num + part_outputs[k] * part_tokens_num
-                ) / new_outputs["tokens_num"]
-            elif(k != "word_normalized_ppl"):
-                new_outputs[k] = (
-                    outputs[k] * batch_size + part_outputs[k] * part_batch_size
-                ) / new_outputs["batch_size"]
-
-        if(self.validation_words > 0):
-            new_outputs["word_normalized_ppl"] = math.exp(new_outputs["valid_sum_logp"] / self.validation_words)
-
+        new_outputs = dict(outputs)
+        for key in part_outputs:
+            if((key.startswith("sum_tokens_") or key == "tokens_num" or key.startswith("sta_") or key=="batch_size") and key in outputs):
+                new_outputs[key] += part_outputs[key]
+            else:
+                new_outputs[key] = part_outputs[key]
+        new_outputs = {key: float(new_outputs[key].numpy()) if paddle.is_tensor(new_outputs[key]) else float(new_outputs[key]) for key in new_outputs}
         return new_outputs
