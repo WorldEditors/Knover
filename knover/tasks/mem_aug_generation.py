@@ -64,6 +64,9 @@ class MemAugGeneration(DialogGeneration):
                 new_outputs[key] = part_outputs[key]
         return new_outputs
 
+    def format_outputs(self, outputs):
+        return {key: float(outputs[key].numpy()) if paddle.is_tensor(outputs[key]) else float(outputs[key]) for key in outputs}
+
     def post_process(self, outputs, info):
         """
         outputs: dicts of statistics
@@ -74,7 +77,7 @@ class MemAugGeneration(DialogGeneration):
         for key in info:
             if(key.startswith("sta_")):
                 new_outputs[key] = info[key]
-        return new_outputs
+        return self.format_outputs(new_outputs)
 
     def train_step(self, model: ModelInterface, inputs):
         """Run one training step."""
@@ -123,6 +126,7 @@ class MemAugGeneration(DialogGeneration):
         """Run one inference step."""
         raise NotImplementedError("Inference for mem augmented transformer is not yet implemented")
 
+
     def get_metrics(self, outputs):
         """Get metrics."""
         if outputs is None:
@@ -146,7 +150,6 @@ class MemAugGeneration(DialogGeneration):
             if(key.endswith("_logp") and key.startswith("avg_")):
                 avg_metrics[key.replace("_logp", "_ppl")] = math.exp(metrics[key])
         metrics.update(avg_metrics)
-        metrics = {key: float(metrics[key].numpy()) if paddle.is_tensor(metrics[key]) else float(metrics[key]) for key in metrics}
 
         return metrics
 
@@ -171,5 +174,4 @@ class MemAugGeneration(DialogGeneration):
                 new_outputs[key] += part_outputs[key]
             else:
                 new_outputs[key] = part_outputs[key]
-        new_outputs = {key: float(new_outputs[key].numpy()) if paddle.is_tensor(new_outputs[key]) else float(new_outputs[key]) for key in new_outputs}
         return new_outputs
