@@ -18,17 +18,15 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 
-from knover.modules.rel_pos_attention import RelPosLayer
-from knover.modules.recformer_block import MemAugDecoderLayer, MemAugDecoder
 from knover.models import register_model
 from knover.core.model import Model
 from knover.modules.generator import Generator
 from knover.utils import gather, str2bool
 
 
-@register_model("TransformerXL")
-class TransformerXL(Model):
-    """RecFormer"""
+@register_model("TransformerAR")
+class TransformerAR(Model):
+    """Unified Transformer"""
 
     @classmethod
     def add_cmdline_args(cls, parser):
@@ -52,44 +50,20 @@ class TransformerXL(Model):
         self.emb_size = args.get("emb_size", args.hidden_size)
         self.hidden_size = args.hidden_size
         self.dropout = args.hidden_dropout_prob
-        self.relative_position_min = args.relative_position_min
-        self.relative_position_max = args.relative_position_max
-        self.use_relative_position = args.use_relative_position
 
         self.n_layer = args.num_hidden_layers
         self.n_head = args.num_attention_heads
         self.d_key = args.get("key_size", self.hidden_size // self.n_head)
         self.d_value = args.get("value_size", self.hidden_size // self.n_head)
         self.inner_hidden_size = args.get("inner_hidden_size", self.hidden_size * 4)
-        self.memory_length = args.get("memory_length", 256)
-        # 0, naive transformer XL; 1, cross layer recurrence
-        self.rec_style = args.get("rec_style", 0)
-        print("recursion stype is: %d"%self.rec_style)
 
         # embeddings
         self.vocab_size = args.vocab_size
         self.type_size = args.type_vocab_size
-        if(self.type_size < 1):
-            self.type_embedding = None
-        else:
-            self.type_embedding = nn.Embedding(self.type_size, self.emb_size, weight_attr=param_attr)
-
+        self.pos_size = args.max_position_embeddings
         self.token_embedding = nn.Embedding(self.vocab_size, self.emb_size, weight_attr=param_attr)
-        self.use_absolute_position = args.get("use_absolute_position", True)
-
-        self.relative_position_min = args.get("dec_relative_position_min", - (max_mem_len + self.max_segment_length))
-        self.relative_position_max = args.get("dec_relative_position_max", 0)
-
-        # Use relative position layer or position embedding depending on use relative position or not
-        self.rel_pos_layer = RelPosLayer(rel_min=self.relative_position_min, 
-                rel_max = self.relative_position_max, 
-                emb_size = self.hidden_size, weight_attr=param_attr)
-
-        if(self.use_absolute_position):
-            self.pos_embedding = nn.Embedding(self.max_segment_length, self.emb_size, weight_attr=param_attr)
-            print("use both relative position and absolute position")
-        else:
-            self.pos_embedding = None
+        self.type_embedding = nn.Embedding(self.type_size, self.emb_size, weight_attr=param_attr)
+        self.pos_embedding = nn.Embedding(self.pos_size, self.emb_size, weight_attr=param_attr)
 
         # role embeddings
         self.use_role = args.use_role
@@ -104,22 +78,27 @@ class TransformerXL(Model):
         if self.emb_mapping_in:
             self.emb_mapping_fc = nn.Linear(self.emb_size, self.hidden_size, weight_attr=param_attr)
 
-        # memories
-        self.memories = None
-
+        # transformer encoder
         self.normalize_before = args.get("normalize_before", True)
         self.hidden_act = args.hidden_act
-
-        decoder_layer = MemAugDecoderLayer(
-            self.hidden_size, self.n_head, self.inner_hidden_size, rel_pos_layer=self.rel_pos_layer, dropout=self.dropout, activation=self.hidden_act,
-            act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
-
         if not self.normalize_before:
             self.input_norm = nn.LayerNorm(self.hidden_size)
         else:
             self.input_norm = None
-
-        self.decoder = MemAugDecoder(decoder_layer, self.hidden_size, self.n_layer, self.normalize_before)
+        encoder_layer = nn.TransformerEncoderLayer(
+            self.hidden_size,
+            self.n_head,
+            self.inner_hidden_size,
+            dropout=self.dropout,
+            activation=self.hidden_act,
+            act_dropout=0,
+            normalize_before=self.normalize_before,
+            weight_attr=param_attr)
+        if self.normalize_before:
+            output_norm = nn.LayerNorm(self.hidden_size)
+        else:
+            output_norm = None
+        self.encoder = nn.TransformerEncoder(encoder_layer, self.n_layer, output_norm)
 
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
@@ -148,26 +127,20 @@ class TransformerXL(Model):
         Args:
             tokens_ids: represents the token id of each token, shape is [batch_size, max_seq_len, 1]
             type_ids: represents the type of each token, shape is [batch_size, max_seq_len, 1]
+            pos_ids: represents the position of each token, shape is [batch_size, max_seq_len, 1]
+            input_mask: represents the attention masking mastrix in each Transformer blocks,
+                shape is [batch_size, max_seq_len, max_seq_len]
             aux_emb: represents the auxiliary input embeddings of Transformer.
 
         Returns:
             A Tuple contains the input embeddings and the attention masking matrix of Transformer.
         """
-        batch_size = token_ids.shape[0]
-        segment_length = token_ids.shape[1]
-
-        if(segment_length > self.max_segment_length):
-            raise Exception("segment length %f, max segment length: %f"%(segment_length, self.max_segment_length))
-        emb_out = self.token_embedding(token_ids)
-
-        if(self.pos_embedding is not None):
-            pos_ids = paddle.tile(paddle.arange(segment_length), [batch_size, 1])
-            pos_emb_out = self.pos_embedding(pos_ids)
-            emb_out = emb_out + pos_emb_out
-
-        if(self.type_embedding is not None):
-            type_emb_out = self.type_embedding(type_ids)
-            emb_out = emb_out + type_emb_out
+        batch_sz, seq_len = token_ids.shape
+        pos_ids = paddle.tile(paddle.arange(seq_len), [batch_sz, 1])
+        token_emb_out = self.token_embedding(token_ids)
+        type_emb_out = self.type_embedding(type_ids)
+        pos_emb_out = self.pos_embedding(pos_ids)
+        emb_out = token_emb_out + type_emb_out + pos_emb_out
 
         if self.use_role:
             role_emb_out = self.role_embedding(role_ids)
@@ -183,75 +156,66 @@ class TransformerXL(Model):
         if self.input_norm is not None:
             emb_out = self.input_norm(emb_out)
 
-        return emb_out
+        attn_bias = paddle.tensor.triu((paddle.ones(
+                (seq_len, seq_len), dtype=paddle.get_default_dtype()) * -1e4), 1)
+        attn_bias = paddle.tile(attn_bias, [batch_sz, self.n_head, 1, 1])
+
+        return emb_out, attn_bias
 
     def _generation_network(self,
                             token_ids,
                             type_ids,
-                            role_ids,
+                            role_ids=None,
                             aux_emb=None):
         """Run Transformer generation network.
 
         Args:
             tokens_ids: represents the token id of each token, shape is [batch_size, max_seq_len, 1]
             type_ids: represents the type of each token, shape is [batch_size, max_seq_len, 1]
+            pos_ids: represents the position of each token, shape is [batch_size, max_seq_len, 1]
+            input_mask: represents the attention masking mastrix in each Transformer blocks,
+                shape is [batch_size, max_seq_len, max_seq_len]
             aux_emb: represents the auxiliary input embeddings of Transformer.
 
         Returns:
             The output embeddings of Transformer.
         """
-        emb_input = self._gen_input(
+        emb_input, attn_bias = self._gen_input(
             token_ids, type_ids, role_ids, aux_emb=aux_emb)
         if self._generation_caches is None:
-            enc_out =  self._encode(emb_input)
+            enc_out =  self._encode(emb_input, attn_bias)
         else:
             enc_out, self._generation_caches = self._encode(
-                emb_input, self._generation_caches)
+                emb_input, attn_bias, self._generation_caches)
         return enc_out
 
     def _generation_step(self, state):
         # gather caches
         if "parent_idx" in state:
-            raise Exception("RecFormer (Transformer-XL) can not support beam search currently")
+            self._generation_caches = gather(self._generation_caches, state["parent_idx"])
         enc_out = self._generation_network(
             state["token_ids"],
             state["type_ids"],
             state.get("role_ids", None),
+            state["tgt_generation_mask"],
         )
         logits = self._calc_logits(enc_out)
         return logits
 
-    def _encode(self, emb_input, caches=None):
+    def _encode(self, emb_input, attn_bias, caches=None):
         """Run Transformer encode pass.
 
         Args:
-            emb_input: represents the input embeddings fo Transformer, shape is [batch_size, max_seq_len, hidden_dim]
-            caches: Dict of {"seg_id": n_seg_id,
-                "memories": long_term_memories,
-                "kv": key_value_cache_for_encoder
-            }
+            emb_input: represents the input embeddings of Transformer, shape is [batch_size, max_seq_len, hidden_size]
+            attn_bias: represents the attention masking matrix, shape is [batch_size, 1, max_seq_len, max_seq_len]
+            caches: a dict, the caches used in efficient decoding, which cache Ks and Vs of memory in each MHA.
+            gather_idx: a index tensor, which determine which branch is used to generate next token.
 
         Returns:
             The output embeddings of Transformer.
         """
-        outputs = []
-        l_s = emb_input.shape[1]
-
-        # Output size [Batch, SegLen, HiddenDim]
-        mask = paddle.tensor.triu((paddle.ones(
-            (l_s, l_s), dtype=paddle.get_default_dtype()) * -1.0e+10), 1)
-
-        if(caches is not None):
-            hids, output, caches = self.decoder(self.memories, emb_input, detach_memory=True, tgt_mask=mask, cache=caches)
-        else:
-            hids, output = self.decoder(self.memories, emb_input, detach_memory=True, tgt_mask=mask)
-
-        # Update Short Term Memory
-        self.update_memories(hids, self.rec_style)
-
-        # Re-concatenate all the results
-
-        return output if caches is None else (output, caches)
+        print("encoder:", attn_bias.shape)
+        return self.encoder(emb_input, attn_bias, caches)
 
     def _calc_logits(self, enc_out, tgt_idx=None):
         """Get the logits of generation task.
@@ -259,7 +223,7 @@ class TransformerXL(Model):
         The network may share weight with token embeddings.
 
         Args:
-            enc_out: the output embeddings of Transformer, shape is [batch_size, max_seq_len, hidden_dim]
+            enc_out: the output embeddings of Transformer, shape is [batch_size, max_seq_len, hidden_size]
             tgt_idx (optional): the indices of prediction tokens, shape is [num_predictions, 2].
 
         Returns:
@@ -288,15 +252,15 @@ class TransformerXL(Model):
         """Run model main forward."""
         outputs = {}
         if is_infer:
-            self._generation_caches = self.encoder.gen_cache()
+            self._generation_caches = self.encoder.gen_cache(inputs["token_ids"])
         else:
             self._generation_caches = None
+
         outputs["enc_out"] = self._generation_network(
             token_ids=inputs["token_ids"],
             type_ids=inputs["type_ids"],
             role_ids=inputs.get("role_ids", None),
         )
-
         return outputs
 
     def get_metrics(self, inputs, outputs):
@@ -304,7 +268,8 @@ class TransformerXL(Model):
         metrics = {}
 
         if "tgt_idx" in inputs:
-            raise Exception("Target Idx can not be used for transformer-xl")
+            tgt_logits = self._calc_logits(outputs["enc_out"], inputs["tgt_idx"])
+            mean_tgt_lm_loss = F.cross_entropy(tgt_logits, inputs["tgt_label"])
         else:
             tgt_logits = self._calc_logits(outputs["enc_out"])
             # Data Reader has processed tgt_logits with :-1
@@ -318,8 +283,8 @@ class TransformerXL(Model):
     def get_statistics(self, inputs, outputs):
         """Get statistics."""
         statistics = {}
-        #if "tgt_label" in inputs:
-        #    statistics["tokens_num"] = outputs["tokens_num"]
+        if "tgt_label" in inputs:
+            statistics["tokens_num"] = inputs["tgt_label"].shape[0]
         statistics["batch_size"] = inputs["token_ids"].shape[0]
         return statistics
 
@@ -328,28 +293,32 @@ class TransformerXL(Model):
 
         Only support generation now.
         """
-        raise NotImplementedError
+        if self.do_generation:
+            outputs = self.generator(self, inputs, outputs)
+            data_id_list = outputs["data_id"].numpy()
+            token_ids_list = outputs["token_ids"].numpy()
+            seq_ids_list = outputs["finished_ids"].numpy()
+            score_list = outputs["finished_score"].numpy()
+            predictions = []
+            for data_id, token_ids, seq_ids, score in zip(data_id_list, token_ids_list, seq_ids_list, score_list):
+                if len(seq_ids.shape) == 1:
+                    pred = {}
+                    pred["data_id"] = int(data_id)
+                    pred["decode_score"] = float(score)
+                    pred["context_token_ids"] = token_ids
+                    pred["response_token_ids"] = seq_ids
+                    predictions.append(pred)
+                else:
+                    for candidate_seq_ids, candidate_score in zip(seq_ids, score):
+                        pred = {}
+                        pred["data_id"] = int(data_id)
+                        pred["decode_score"] = float(candidate_score)
+                        pred["context_token_ids"] = token_ids
+                        pred["response_token_ids"] = candidate_seq_ids
+                        predictions.append(pred)
+            return predictions
+        else:
+            raise NotImplementedError
 
     def reset_memories(self, batch_size):
-        self.memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * self.n_layer
-
-    def update_memories(self, hids, rec_style):
-        new_memories = []
-        mem_len = self.memories[0].shape[1]
-        hid_len = hids[0].shape[1]
-        max_len = mem_len + hid_len
-        if(rec_style == 0):
-            #naive XL
-            st_mems = hids[:-1]
-        elif(rec_style == 1):
-            #cross layer
-            st_mems = hids[1:]
-        else:
-            raise Exception("No such recursion style:", rec_style)
-        for i, hid in enumerate(st_mems):
-            if(hid_len <= mem_len):
-                new_hid = paddle.concat([self.memories[i], hid], axis=1)
-            else:
-                new_hid = hid
-            new_memories.append(paddle.slice(new_hid, axes=[1], starts=[-mem_len], ends=[max_len]))
-        self.memories = new_memories
+        pass

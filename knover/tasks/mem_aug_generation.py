@@ -34,7 +34,6 @@ class MemAugGeneration(DialogGeneration):
         super(MemAugGeneration, self).__init__(args)
         self.reader = LongTextReader(args)
         self.validation_step = args.validation_step
-        self.validation_words = args.validation_words
         self.step = 0
         if(self.reader.use_role):
             self.train_keys = ["token_ids", "type_ids", "role_ids", "tgt_label", "loss_mask"]
@@ -51,8 +50,6 @@ class MemAugGeneration(DialogGeneration):
                 help="length of each segments")
         group.add_argument("--validation_step", type=int, default=1000,
                 help="use inner validation steps")
-        group.add_argument("--validation_words", type=int, default=-1,
-                help="used for calculate ppl_per_word")
         DialogGeneration.add_cmdline_args(parser)
 
     def merge_outputs_inbatch(self, outputs, part_outputs):

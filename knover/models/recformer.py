@@ -26,6 +26,7 @@ from knover.core.model import Model
 from knover.modules.generator import Generator
 from knover.utils import gather, str2bool
 
+INT_MAX=999999
 
 @register_model("RecFormer")
 class RecFormer(Model):
@@ -63,6 +64,7 @@ class RecFormer(Model):
         self.memory_length = args.get("memory_length", 256)
         self.max_segment_length = args.get("max_segment_length", 256)
         self.aux_loss_weight = args.get("auxiliary_loss_weight", 0.1)
+        self.use_absolute_position = args.get("use_absolute_position", True)
 
         max_mem_len = self.memory_length +  self.max_segment_length
 
@@ -81,6 +83,11 @@ class RecFormer(Model):
             self.type_embedding = nn.Embedding(self.type_size, self.emb_size, weight_attr=param_attr)
 
         self.token_embedding = nn.Embedding(self.vocab_size, self.emb_size, weight_attr=param_attr)
+        if(self.use_absolute_position):
+            self.pos_embedding = nn.Embedding(self.max_segment_length, self.emb_size, weight_attr=param_attr)
+            print("use both relative position and absolute position")
+        else:
+            self.pos_embedding = None
 
         # Use relative position layer or position embedding depending on use relative position or not
         self.rel_pos_layer_enc = RelPosLayer(rel_min=self.enc_relative_position_min, 
@@ -129,15 +136,6 @@ class RecFormer(Model):
             act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
         self.decoder = MemAugDecoder(self.decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
 
-        # Auxiliary Memory Decoder
-        if(self.aux_loss_weight > 0.0):
-            self.aux_decoder_layer = MemAugDecoderLayer(
-                self.hidden_size, self.n_head, self.inner_hidden_size, rel_pos_layer=self.rel_pos_layer_dec, dropout=self.dropout, activation=self.hidden_act,
-                act_dropout=0, normalize_before=self.normalize_before, weight_attr=param_attr)
-            self.aux_decoder = MemAugDecoder(self.aux_decoder_layer, self.hidden_size, self.n_layer, normalize_before=self.normalize_before)
-        else:
-            self.aux_decoder = None
-
         # lm head
         self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
         self.activation = getattr(F, self.hidden_act)
@@ -172,13 +170,14 @@ class RecFormer(Model):
         """
         batch_size = token_ids.shape[0]
         segment_length = token_ids.shape[1]
+        if(segment_length > self.max_segment_length):
+            raise Exception("segment length %f, max segment length: %f"%(segment_length, self.max_segment_length))
         emb_out = self.token_embedding(token_ids)
 
-        #if(not self.use_relative_position):
-        #    pos_ids = paddle.to_tensor([list(range(segment_length))] * batch_size)
-        #    pos_ids = paddle.clip(pos_ids, max=self.max_positions-1)
-        #    pos_emb_out = self.pos_embedding(pos_ids)
-        #    emb_out = emb_out + pos_emb_out
+        if(self.pos_embedding is not None):
+            pos_ids = paddle.tile(paddle.arange(segment_length), [batch_size, 1])
+            pos_emb_out = self.pos_embedding(pos_ids)
+            emb_out = emb_out + pos_emb_out
 
         if(self.type_embedding is not None):
             type_emb_out = self.type_embedding(type_ids)
@@ -255,19 +254,19 @@ class RecFormer(Model):
 
         if(caches is not None):
             hids, output, caches = self.decoder(self.memories, emb_input,
-                    additional_memories=self.st_memories,
+                    additional_memories=self.st_memories[:-1],
                     detach_memory=True,
                     tgt_mask=mask, 
                     cache=caches)
         else:
             hids, output = self.decoder(self.memories, emb_input,
-                    additional_memories=self.st_memories,
+                    additional_memories=self.st_memories[:-1],
                     detach_memory=True,
                     tgt_mask=mask)
 
         self.update_memories(hids)
 
-        #Recalculate the hids and outputs, only when cache is None (Training Phase)
+        # Use the updated memory to recalculate the attentions
         if(caches is None):
             hids_cont, output_cont = self.decoder(self.memories, emb_input, tgt_mask=mask, 
                     detach_memory=False,
@@ -367,17 +366,33 @@ class RecFormer(Model):
 
     def reset_memories(self, batch_size):
         self.memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * self.n_layer
-        self.st_memories = None
+        self.st_memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * (self.n_layer + 1)
+        self.valid_st = 0
 
     def update_memories(self, hids):
+        #update short term memory
+        obs_memories = []
+        new_st_memories = []
+        batch_size, seq_len, _ = hids[0].shape
+        self.valid_st += seq_len
+        if(self.valid_st > self.memory_length):
+            obs_st_len = self.valid_st - self.memory_length
+            self.valid_st = self.memory_length
+        else:
+            obs_st_len = 0
+        for i,hid in enumerate(hids):
+            obs_mem, new_st_mem = paddle.chunk(paddle.concat([self.st_memories[i], hid], axis=1), chunks=[seq_len, self.memory_length], axis=1)
+            new_st_memories.append(new_st_mem)
+            if(obs_st_len > 0):
+                obs_memories.append(paddle.slice(obs_mem, axes=[1], starts=[-obs_st_len], ends=[seq_len]))
+        self.st_memories = new_st_memories
+
         #update long term memory
-        if(self.st_memories is not None):
+        if(obs_st_len > 0):
             new_lt_mems = []
             for i, layer in enumerate(self.encoders):
-                new_lt_mems.append(layer(self.memories[i], self.st_memories[i]))
+                new_lt_mems.append(layer(self.memories[i], obs_memories[i]))
             self.memories = new_lt_mems
-        #update short term memory
-        self.st_memories = hids[:-1]
 
     def detach_memories(self):
         self.memories = [mem.detach() for mem in self.memories]

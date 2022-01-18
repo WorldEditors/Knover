@@ -296,10 +296,7 @@ class MemAugDecoder(Layer):
         parameter_no_grad:  use static (fixed) parameter (do not backward the parameter)
         """
         seq_len = tgt.shape[1]
-        if(memories is None):
-            mem_len = 0
-        else:
-            mem_len = memories[0].shape[1]
+        mem_len = memories[0].shape[1]
         if(additional_memories is not None):
             mem_len += additional_memories[0].shape[1]
         if(tgt_mask is not None and mem_len > 0):
@@ -316,14 +313,10 @@ class MemAugDecoder(Layer):
             new_memories.append(output)
 
         for i, mod in enumerate(self.layers):
-            if(mem_len <= 0):
-                mem = None
-            elif(memories is not None and additional_memories is not None):
+            if(additional_memories is not None):
                 mem = paddle.concat([memories[i], additional_memories[i]], axis=1)
-            elif(memories is not None):
-                mem = memories[i]
             else:
-                mem = additional_memories[i]
+                mem = memories[i]
 
             if caches is None:
                 output = mod(mem, output,

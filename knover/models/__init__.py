@@ -73,3 +73,4 @@ def add_cmdline_args(parser):
 import knover.models.unified_transformer
 import knover.models.recformer
 import knover.models.transformer_xl
+import knover.models.transformer
