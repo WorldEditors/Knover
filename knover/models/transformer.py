@@ -214,7 +214,6 @@ class TransformerAR(Model):
         Returns:
             The output embeddings of Transformer.
         """
-        print("encoder:", attn_bias.shape)
         return self.encoder(emb_input, attn_bias, caches)
 
     def _calc_logits(self, enc_out, tgt_idx=None):
