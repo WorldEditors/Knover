@@ -248,20 +248,20 @@ def evaluate(task,
 
         if step % args.log_steps == 0:
             metrics = task.get_metrics(outputs)
-            print(f"\tstep {step}:" + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
+            #print(f"\tstep {step}:" + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
 
     if args.is_distributed:
         # save part evaluation outputs in distributed mode.
-        part_file = os.path.join(args.save_path, f"evaluation_output.part_{gpu_id}")
+        part_file = os.path.join(args.save_path, f"evaluation_output-{tag}.part_{gpu_id}")
         with open(part_file, "w") as fp:
             json.dump(outputs, fp, ensure_ascii=False)
-        part_finish_file = os.path.join(args.save_path, f"evaluation_output.part_{gpu_id}.finish")
+        part_finish_file = os.path.join(args.save_path, f"evaluation_output-{tag}.part_{gpu_id}.finish")
         with open(part_finish_file, "w"):
             pass
 
         if gpu_id == 0:
             # wait part evaluation outputs
-            part_files = f"evaluation_output.part_*.finish"
+            part_files = f"evaluation_output-{tag}.part_*.finish"
             while True:
                 ret = run_cmd(f"find {args.save_path} -maxdepth 1 -name {part_files}")
                 num_completed = len(ret.split("\n"))
@@ -272,22 +272,23 @@ def evaluate(task,
             # merge part evaluation outputs
             outputs = None
             for dev_id in range(dev_count):
-                part_file = os.path.join(args.save_path, f"evaluation_output.part_{dev_id}")
+                part_file = os.path.join(args.save_path, f"evaluation_output-{tag}.part_{dev_id}")
                 with open(part_file, "r") as fp:
                     part_outputs = json.load(fp)
                     outputs = task.merge_metrics_and_statistics(outputs, part_outputs)
-            run_cmd("rm " + os.path.join(args.save_path, "evaluation_output.part_*"))
+                    print(f"\t{dev_id}: {json.dumps(outputs)}")
+            run_cmd("rm " + os.path.join(args.save_path, "evaluation_output-{tag}.part_*"))
 
             # send evaluation outputs
             for dev_id in range(1, dev_count): # exclude gpu 0
-                part_file = os.path.join(args.save_path, f"evaluation_output.final_part_{dev_id}")
+                part_file = os.path.join(args.save_path, f"evaluation_output-{tag}.final_part_{dev_id}")
                 with open(part_file, "w") as fp:
                     json.dump(outputs, fp, ensure_ascii=False)
                 with open(part_file + ".finish", "w") as fp:
                     pass
         else:
             # receive evaluation outputs
-            part_file = os.path.join(args.save_path, f"evaluation_output.final_part_{gpu_id}")
+            part_file = os.path.join(args.save_path, f"evaluation_output-{tag}.final_part_{gpu_id}")
             while not os.path.exists(part_file + ".finish"):
                 time.sleep(1)
             with open(part_file, "r") as fp:

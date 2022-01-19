@@ -52,9 +52,8 @@ class TransformerXL(Model):
         self.emb_size = args.get("emb_size", args.hidden_size)
         self.hidden_size = args.hidden_size
         self.dropout = args.hidden_dropout_prob
-        self.relative_position_min = args.relative_position_min
-        self.relative_position_max = args.relative_position_max
         self.use_relative_position = args.use_relative_position
+        self.max_segment_length = args.get("max_segment_length", 256)
 
         self.n_layer = args.num_hidden_layers
         self.n_head = args.num_attention_heads
@@ -77,8 +76,13 @@ class TransformerXL(Model):
         self.token_embedding = nn.Embedding(self.vocab_size, self.emb_size, weight_attr=param_attr)
         self.use_absolute_position = args.get("use_absolute_position", True)
 
-        self.relative_position_min = args.get("dec_relative_position_min", - (max_mem_len + self.max_segment_length))
-        self.relative_position_max = args.get("dec_relative_position_max", 0)
+        if(self.memory_length < 0):
+            rel_length = self.max_segment_length
+        else:
+            rel_length = self.memory_length + self.max_segment_length
+        self.relative_position_min = args.get("relative_position_min", -rel_length)
+        self.relative_position_max = args.get("relative_position_max", 0)
+        self.use_absolute_position = args.get("use_absolute_position", True)
 
         # Use relative position layer or position embedding depending on use relative position or not
         self.rel_pos_layer = RelPosLayer(rel_min=self.relative_position_min, 
@@ -331,25 +335,31 @@ class TransformerXL(Model):
         raise NotImplementedError
 
     def reset_memories(self, batch_size):
-        self.memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * self.n_layer
+        if(self.memory_length < 1):
+            self.memories = None
+        else:
+            self.memories = [paddle.full(shape=[int(batch_size), self.memory_length, self.hidden_size], fill_value=0.0)] * self.n_layer
 
     def update_memories(self, hids, rec_style):
-        new_memories = []
-        mem_len = self.memories[0].shape[1]
-        hid_len = hids[0].shape[1]
-        max_len = mem_len + hid_len
-        if(rec_style == 0):
-            #naive XL
-            st_mems = hids[:-1]
-        elif(rec_style == 1):
-            #cross layer
-            st_mems = hids[1:]
+        if(self.memory_length < 1):
+            self.memories = None
         else:
-            raise Exception("No such recursion style:", rec_style)
-        for i, hid in enumerate(st_mems):
-            if(hid_len <= mem_len):
-                new_hid = paddle.concat([self.memories[i], hid], axis=1)
+            new_memories = []
+            mem_len = self.memories[0].shape[1]
+            hid_len = hids[0].shape[1]
+            max_len = mem_len + hid_len
+            if(rec_style == 0):
+                #naive XL
+                st_mems = hids[:-1]
+            elif(rec_style == 1):
+                #cross layer
+                st_mems = hids[1:]
             else:
-                new_hid = hid
-            new_memories.append(paddle.slice(new_hid, axes=[1], starts=[-mem_len], ends=[max_len]))
-        self.memories = new_memories
+                raise Exception("No such recursion style:", rec_style)
+            for i, hid in enumerate(st_mems):
+                if(hid_len <= mem_len):
+                    new_hid = paddle.concat([self.memories[i], hid], axis=1)
+                else:
+                    new_hid = hid
+                new_memories.append(paddle.slice(new_hid, axes=[1], starts=[-mem_len], ends=[max_len]))
+            self.memories = new_memories

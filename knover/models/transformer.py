@@ -282,8 +282,8 @@ class TransformerAR(Model):
     def get_statistics(self, inputs, outputs):
         """Get statistics."""
         statistics = {}
-        if "tgt_label" in inputs:
-            statistics["tokens_num"] = inputs["tgt_label"].shape[0]
+        #if "tgt_label" in inputs:
+        #    statistics["tokens_num"] = inputs["tgt_label"].shape[0]
         statistics["batch_size"] = inputs["token_ids"].shape[0]
         return statistics
 

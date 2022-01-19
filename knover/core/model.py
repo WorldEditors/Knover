@@ -445,10 +445,9 @@ class ModelInterface(object):
         with paddle.no_grad():
             if self.is_distributed:
                 #self.dp_model.eval()
+                #metrics = self.dp_model(inputs, mode="eval")
                 self.model.eval()
-                metrics = self.dp_model(inputs, mode="eval")
-                #self.model.eval()
-                #metrics = self.model(inputs, mode="eval")
+                metrics = self.model(inputs, mode="eval")
             else:
                 self.model.eval()
                 metrics = self.model(inputs, mode="eval")

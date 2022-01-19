@@ -452,7 +452,7 @@ class DialogReader(object):
                 yield batch
         return __wrapper__
 
-    def _get_sorted_batch(self, reader):
+    def _get_sorted_batch(self, reader, shuffle=True):
         """Yield sorted batches from record reader."""
         def _get_sorted_batch_from_pool(pool):
             """Generate sorted batches from pool."""
@@ -475,7 +475,8 @@ class DialogReader(object):
 
             if len(batch) > 0:
                 batches.append(batch)
-            self.global_rng.shuffle(batches)
+            if(shuffle):
+                self.global_rng.shuffle(batches)
 
             for batch in batches:
                 yield batch
@@ -495,7 +496,7 @@ class DialogReader(object):
     def _batch_reader(self, reader, phase=None, is_infer=False):
         """Construct a batch reader from a record reader."""
         if self.sort_pool_size > 0 and not is_infer:
-            return self._get_sorted_batch(reader)
+            return self._get_sorted_batch(reader, shuffle=("train" in phase))
         else:
             return self._get_batch(reader)
 
