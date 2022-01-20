@@ -101,9 +101,9 @@ class TransformerAR(Model):
         self.encoder = nn.TransformerEncoder(encoder_layer, self.n_layer, output_norm)
 
         # lm head
-        self.lm_trans_fc = nn.Linear(self.hidden_size, self.hidden_size, weight_attr=param_attr)
+        self.lm_trans_fc = nn.Linear(self.hidden_size, self.emb_size, weight_attr=param_attr)
         self.activation = getattr(F, self.hidden_act)
-        self.lm_trans_norm = nn.LayerNorm(self.hidden_size)
+        self.lm_trans_norm = nn.LayerNorm(self.emb_size)
         self.weight_sharing = args.weight_sharing
         if self.weight_sharing:
             self.lm_logits_bias = paddle.create_parameter(
