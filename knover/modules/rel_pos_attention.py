@@ -50,7 +50,7 @@ class RelPosLayer(Layer):
         self.rel_min = rel_min
         self.rel_max = rel_max
         self.emb_size = emb_size
-        self.emb_num = rel_max - rel_min
+        self.emb_num = rel_max - rel_min + 1
 
         # create a position embedding parameter
         self.position_emb = self.create_parameter(
@@ -205,23 +205,24 @@ class MultiHeadRelPosAttention(Layer):
         value = query if value is None else value
 
         # calculate the query / key absolute position id
-        # rel_min: -20
-        # rel_max: +10
+        # rel_min: -9
+        # rel_max: +9
         # emb_num: +30
         # rel_pos_start_key: -10
         nb = query.shape[0]
         l_q = query.shape[1] # 10
         l_k = key.shape[1] # 20
-        rel_s = rel_pos_start_key - l_q # -20
-        rel_e = rel_pos_start_key + l_k # +10
+        rel_s = rel_pos_start_key - (l_q - 1) # -9
+        rel_e = rel_pos_start_key + (l_k - 1) # +19
         
         pos_emb_s = self.rel_pos_layer.relative_pos_2_emb(rel_s) # 0
-        pos_emb_e = self.rel_pos_layer.relative_pos_2_emb(rel_e) # 30
-        max_pos_emb = self.rel_pos_layer.emb_num # 30
-        max_pos_span = l_q + l_k # 30
+        pos_emb_e = self.rel_pos_layer.relative_pos_2_emb(rel_e) # 28
+        max_pos_emb = self.rel_pos_layer.emb_num # Max Number of Relative Embeddings being set 19
+        max_pos_span = l_q + l_k - 1 # Actual Required Number of Relative Embeddings 29
         
-        s_fill = pos_emb_s # 0
-        e_fill = max_pos_emb - pos_emb_e # 0
+        s_fill = 1 - pos_emb_s # number of how much must be filled in the start, we add extra 1 to make the length l_q + l_k
+        e_fill = pos_emb_e + 1 - max_pos_emb # number of the positions to be filled at the end, we add 1 to make the length l_q + l_k
+                                             # notice that s_fill + e_fill + max_pos_emb = l_q + l_k must be satisfied
 
         # compute q ,k ,v
         if cache is None:
@@ -231,7 +232,6 @@ class MultiHeadRelPosAttention(Layer):
 
         alpha = self.head_dim**-0.5
         # scale dot product attention
-        # TODO(guosheng): use tensor.matmul, however it doesn't support `alpha`
         # prod_cc: `[batch_size, num_heads, q_seq_length, k_seq_length]`
         prod_cc = alpha * paddle.matmul(x=qw, y=k, transpose_y=True)
         # prod_cp
@@ -239,26 +239,26 @@ class MultiHeadRelPosAttention(Layer):
         # acquiring `[batch_size, num_heads, q_seq_length, max_pos_emb]`
         prod_cp = alpha * paddle.matmul(x=qr, y=kr, transpose_y=True)
 
-        # acquiring `[batch_size, num_heads, q_seq_length, max_pos_span]` 10, 30
+        # acquiring `[batch_size, num_heads, q_seq_length, max_pos_span + 1]` 10, 30
         # by adding / slicing the rows out of range
-        INT_MAX = 100000 # s_fill = -99, e_fill = 51
-        if(s_fill > 0):
-            prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, s_fill], [INT_MAX, INT_MAX, INT_MAX, INT_MAX])
-        elif(s_fill < 0):
+        INT_MAX = 100000 # s_fill = 1, e_fill = 10
+        if(s_fill < 0):
+            prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, -s_fill], [INT_MAX, INT_MAX, INT_MAX, INT_MAX])
+        elif(s_fill > 0):
             fill_vec_s = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, 0], [INT_MAX, INT_MAX, INT_MAX, 1])
-            fill_vec_s = paddle.tile(fill_vec_s, repeat_times=[1, 1, 1, -s_fill])
+            fill_vec_s = paddle.tile(fill_vec_s, repeat_times=[1, 1, 1, s_fill])
             prod_cp = paddle.concat([fill_vec_s, prod_cp], axis=-1)
-        if(e_fill > 0):
-            prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, 0], [INT_MAX, INT_MAX, INT_MAX, -e_fill])
-        elif(e_fill < 0):
+        if(e_fill < 0):
+            prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, 0], [INT_MAX, INT_MAX, INT_MAX, e_fill])
+        elif(e_fill > 0):
             fill_vec_e = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, -1], [INT_MAX, INT_MAX, INT_MAX, INT_MAX])
-            fill_vec_e = paddle.tile(fill_vec_e, repeat_times=[1, 1, 1, -e_fill])
+            fill_vec_e = paddle.tile(fill_vec_e, repeat_times=[1, 1, 1, e_fill])
             prod_cp = paddle.concat([prod_cp, fill_vec_e], axis=-1)
 
         # Doing Relative shift
-        prod_cp = paddle.reshape(prod_cp, shape=(nb, self.num_heads, max_pos_span, l_q))
+        prod_cp = paddle.reshape(prod_cp, shape=(nb, self.num_heads, max_pos_span + 1, l_q))
         prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 1, 0], [INT_MAX, INT_MAX, INT_MAX, INT_MAX])
-        prod_cp = paddle.reshape(prod_cp, shape=(nb, self.num_heads, l_q, max_pos_span - 1))
+        prod_cp = paddle.reshape(prod_cp, shape=(nb, self.num_heads, l_q, max_pos_span))
         prod_cp = paddle.slice(prod_cp, [0, 1, 2, 3], [0, 0, 0, 0], [INT_MAX, INT_MAX, INT_MAX, l_k])
 
         # final attention before attn_mask
